@@ -6,7 +6,7 @@ import { sampleRoutes } from '../samples/sampleRoutes'
 import { buildContext } from './context'
 import { evaluateStatics, solvePose } from './body'
 import { directionFactor, holdGripSummary } from './grip'
-import { planBeta } from './search'
+import { Planner, planBeta } from './search'
 import type { Contacts } from './types'
 
 const W = 1000
@@ -171,6 +171,30 @@ describe('beta planner', () => {
     expect(steps?.[0].kind).toBe('start')
   })
 
+  it('matches instead of crossing, and prefers a nearby foothold', () => {
+    const r = routeFromMeters(
+      [
+        { id: 's1', x: 1.2, y: 1.6 },
+        { id: 's2', x: 1.8, y: 1.6 },
+        { id: 'far', x: 2.25, y: 2.15 },
+        { id: 'fin', x: 2.1, y: 3.05, radius: 0.04 },
+        { id: 'jug', x: 1.45, y: 0.7, type: 'jug', radius: 0.03 },
+        { id: 'chip', x: 1.55, y: 0.62, type: 'foot-chip', radius: 0.012, allowHand: false },
+        { id: 'f2', x: 1.9, y: 0.55, type: 'foot-chip', radius: 0.012, allowHand: false },
+      ],
+      { start: ['s1', 's2'], finish: ['fin'] },
+    )
+    const ctx = buildContext(r, DEFAULT_CLIMBER)
+    const planner = new Planner(ctx, { beamWidth: 20, perHandPair: 4, maxDepth: 20, maxBetas: 1, timeBudgetMs: 4000 })
+    const start = planner.startNodes().nodes[0]
+    expect(start).toBeTruthy()
+    const left = planner.candidates(start, 'LH').filter((id): id is string => typeof id === 'string')
+    expect(left).toContain(start.contacts.RH)
+    const planted = [start.contacts.LF, start.contacts.RF].filter((f) => f?.kind === 'hold').map((f) => (f && f.kind === 'hold' ? f.id : ''))
+    if (planted.includes('jug') || planted.includes('chip')) expect(planted).toContain('chip')
+    expect(planted).not.toContain('jug')
+  })
+
   it('climbs a vertical jug ladder and explains each move', () => {
     const res = planBeta(ladder(0), DEFAULT_CLIMBER)
     expect(res.ok, res.ok ? '' : `${res.reason} ${res.diagnostics.join('; ')}`).toBe(true)
@@ -198,6 +222,23 @@ describe('beta planner', () => {
       const seq = (i: number) => res.betas[i].steps.map((s) => `${s.limb}:${s.limb ? JSON.stringify(s.contacts[s.limb]) : ''}`).join()
       expect(seq(0)).not.toBe(seq(1))
     }
+  })
+
+  it('finishes a hold that is only a short reach past the planted feet', () => {
+    const r = routeFromMeters(
+      [
+        { id: 's1', x: 1.35, y: 1.5 },
+        { id: 's2', x: 1.7, y: 1.5 },
+        { id: 'a', x: 1.45, y: 2.55 },
+        { id: 'b', x: 1.6, y: 3.45 },
+        { id: 'fin', x: 1.5, y: 3.85, radius: 0.04 },
+        { id: 'f1', x: 1.3, y: 0.45, type: 'foot-chip', radius: 0.012, allowHand: false },
+        { id: 'f2', x: 1.75, y: 0.6, type: 'foot-chip', radius: 0.012, allowHand: false },
+      ],
+      { start: ['s1', 's2'], finish: ['fin'] },
+    )
+    const res = planBeta(r, DEFAULT_CLIMBER, { maxBetas: 1 })
+    expect(res.ok, res.ok ? '' : `${res.reason} ${res.diagnostics.join(' | ')}`).toBe(true)
   })
 
   it('reports a reach failure when a gap is too big, and a taller climber makes it', () => {

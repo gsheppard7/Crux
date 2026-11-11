@@ -49,6 +49,24 @@ function feetLegal(c: Contacts): boolean {
   return onHold(c.LF) || onHold(c.RF)
 }
 
+/** A hold meant for feet: a foot chip, or anything hands are not allowed on. */
+function dedicatedFoot(h: { type: string; hand: boolean }): boolean {
+  return h.type === 'foot-chip' || !h.hand
+}
+
+function footX(f: FootContact, byId: Map<string, { x: number }>): number | null {
+  if (!f) return null
+  if (f.kind === 'smear') return f.x
+  return byId.get(f.id)?.x ?? null
+}
+
+/** Left foot should stay left of the right foot. */
+function feetCrossed(c: Contacts, byId: Map<string, { x: number }>): boolean {
+  const lx = footX(c.LF, byId)
+  const rx = footX(c.RF, byId)
+  return lx != null && rx != null && lx > rx + 0.05
+}
+
 const footKey = (f: FootContact) => (!f ? '-' : f.kind === 'hold' ? `h:${f.id}` : `s:${f.x.toFixed(2)},${f.y.toFixed(2)}`)
 export const contactsKey = (c: Contacts) => `${c.LH}|${c.RH}|${footKey(c.LF)}|${footKey(c.RF)}`
 const q = (v: number) => Math.round(v / 0.05) * 0.05
@@ -164,26 +182,54 @@ export class Planner {
     const c = node.contacts
     if (isHand(limb)) {
       const other = c[limb === 'LH' ? 'RH' : 'LH']
+      const otherLimb = limb === 'LH' ? 'RH' : 'LH'
       const root = shoulderPos(node.pose, ctx, side(limb))
       const minY = Math.min(...[c.LH, c.RH].map((id) => (id ? ctx.byId.get(id)!.y : 0)))
-      const near = ctx.handHolds
+      const myX = c[limb] ? ctx.byId.get(c[limb]!)!.x : null
+      const otherX = other ? ctx.byId.get(other)!.x : null
+      const crosses = (x: number) => (otherX == null ? false : limb === 'LH' ? x > otherX + 0.05 : x < otherX - 0.05)
+      const pool = ctx.handHolds
         .filter((h) => h.id !== c[limb])
-        .filter((h) => h.id !== other || h.matchable || ctx.finishIds.includes(h.id))
         .filter((h) => Math.hypot(h.x - root.x, h.y - root.y) <= ctx.handReach + this.gain + 0.6)
         .filter((h) => h.y >= minY - 0.45)
+      const straight = pool.filter((h) => h.id !== other && !crosses(h.x))
+      const crossing = pool.filter((h) => h.id !== other && crosses(h.x))
+      const otherRoot = shoulderPos(node.pose, ctx, side(otherLimb))
+      const otherCanTake = (h: PlannerHold) => {
+        if (myX == null) return false
+        const otherWouldCross = otherLimb === 'LH' ? h.x > myX + 0.05 : h.x < myX - 0.05
+        if (otherWouldCross) return false
+        return Math.hypot(h.x - otherRoot.x, h.y - otherRoot.y) <= ctx.handReach + this.gain + 0.35
+      }
+      const otherHold = other ? ctx.byId.get(other) : undefined
+      const canMatch =
+        !!other && !!otherHold?.matchable && Math.hypot(otherHold.x - root.x, otherHold.y - root.y) <= ctx.handReach + this.gain + 0.2
+      const bestStraightY = straight.reduce((m, h) => Math.max(m, h.y), Number.NEGATIVE_INFINITY)
+      const crossIsTheWayUp = crossing.filter((h) => h.y > bestStraightY + 0.12)
+      const myY = c[limb] ? ctx.byId.get(c[limb]!)!.y : 0
+      const upwardStraight = straight.filter((h) => h.y > myY + 0.08)
+      const near = pool
+        .filter((h) => h.id !== other || h.matchable || ctx.finishIds.includes(h.id))
         .sort((a, b) => b.y - a.y || a.x - b.x)
         .slice(0, 9)
         .map((h) => h.id)
-      // Always keep finish holds as candidates so the last move isn't pruned by the reach prefilter.
+      // Nothing higher on this side: match, then the other hand takes the hold that would have been a cross.
+      if (other && canMatch && upwardStraight.length === 0 && crossIsTheWayUp.some(otherCanTake)) near.unshift(other)
       for (const id of ctx.finishIds) {
-        if (!near.includes(id) && id !== c[limb] && (id !== other || ctx.byId.get(id)!.matchable)) near.push(id)
+        if (id === c[limb] || near.includes(id)) continue
+        const h = ctx.byId.get(id)!
+        if (!h.matchable && id === other) continue
+        near.push(id)
       }
       return near
     }
     const cur = c[limb]
     const curId = cur && cur.kind === 'hold' ? cur.id : null
-    const otherFoot = c[limb === 'LF' ? 'RF' : 'LF']
+    const otherFootLimb = limb === 'LF' ? 'RF' : 'LF'
+    const otherFoot = c[otherFootLimb]
     const otherFootId = otherFoot?.kind === 'hold' ? otherFoot.id : null
+    const otherFootX = footX(otherFoot, ctx.byId)
+    const crossesFoot = (x: number) => (otherFootX == null ? false : limb === 'LF' ? x > otherFootX + 0.05 : x < otherFootX - 0.05)
     const hip = hipPos(node.pose, ctx, side(limb))
     const maxHandY = Math.max(...[c.LH, c.RH].map((id) => (id ? ctx.byId.get(id)!.y : 0)))
     // Prefer feet that close the gap under the hands when they lag behind.
@@ -198,28 +244,138 @@ export class Planner {
     const yMax = this.footYMax(c)
     const hipLine = this.naturalHipY(c)
     const idealY = needUp ? Math.min(yMax, hipLine - 0.05) : hipLine - 0.4 * ctx.dims.leg
-    const holds: FootContact[] = ctx.footHolds
+    const reachable = ctx.footHolds
       .filter((h) => h.id !== curId && h.id !== otherFootId)
       .filter((h) => h.y >= 0.03 && h.y <= yMax)
       .filter((h) => Math.hypot(h.x - hip.x, h.y - hip.y) <= ctx.footReach + 0.8)
-      .sort((a, b) => Math.abs(a.y - idealY) + 0.5 * Math.abs(a.x - hip.x) - (Math.abs(b.y - idealY) + 0.5 * Math.abs(b.x - hip.x)) || a.id.localeCompare(b.id))
-      .slice(0, 8)
-      .map((h) => ({ kind: 'hold' as const, id: h.id }))
-    const smears = this.smearOptions(node.pose, limb as 'LF' | 'RF', c)
+    const sameSide = reachable.filter((h) => !crossesFoot(h.x))
+    const crossingFeet = reachable.filter((h) => crossesFoot(h.x))
+    const uncrossed = sameSide.length > 0 ? sameSide : reachable
+    const chips = uncrossed.filter(dedicatedFoot)
+    const open = chips.length
+      ? uncrossed.filter((h) => dedicatedFoot(h) || !chips.some((chip) => Math.hypot(chip.x - h.x, chip.y - h.y) < 0.4))
+      : uncrossed
+    const ranked = open.sort((a, b) => {
+      const score = (h: PlannerHold) => Math.abs(h.y - idealY) + 0.5 * Math.abs(h.x - hip.x) + (dedicatedFoot(h) ? -0.25 : 0)
+      return score(a) - score(b) || a.id.localeCompare(b.id)
+    })
+    const crossRanked = crossingFeet.sort((a, b) => Math.abs(a.y - idealY) - Math.abs(b.y - idealY) || a.id.localeCompare(b.id))
+    const holds: FootContact[] = [...ranked.slice(0, 6), ...(sameSide.length > 0 ? crossRanked.slice(0, 2) : [])].map((h) => ({
+      kind: 'hold' as const,
+      id: h.id,
+    }))
+    const smears = this.smearOptions(node.pose, limb as 'LF' | 'RF', c).filter((s) => s.kind === 'smear' && (sameSide.length === 0 || !crossesFoot(s.x)))
     const out = [...holds, ...smears]
     // Flag only when there is no hold and no wall smear (steep terrain). A smear beats sharing one hold.
     if (cur && holds.length === 0 && smears.length === 0) out.push(null)
     return out
   }
 
+  /**
+   * A hand move the body can actually make. The moving hand may deadpoint
+   * out to dynamic reach; the other hand stays within a small shrug.
+   */
+  handSlackOk(pr: PoseResult, moving: 'LH' | 'RH'): { ok: boolean; dynamic: boolean } {
+    const other = moving === 'LH' ? 'RH' : 'LH'
+    for (const v of pr.violations) {
+      const foot = v.startsWith('LF') || v.startsWith('RF')
+      const movingShort = v.startsWith(moving) && v.includes('short')
+      const otherShort = v.startsWith(other) && v.includes('short')
+      if (foot || movingShort || otherShort) continue
+      return { ok: false, dynamic: false }
+    }
+    const extra = (hand: 'LH' | 'RH') => Math.max(0, (pr.stretch[hand] ?? 0) - 1) * this.ctx.handReach
+    if (extra(other) > 0.05) return { ok: false, dynamic: false }
+    const movingExtra = extra(moving)
+    if (movingExtra > this.gain + 0.02) return { ok: false, dynamic: false }
+    const feetOver = (['LF', 'RF'] as const).some((f) => (pr.stretch[f] ?? 0) > 1.02 || pr.violations.some((v) => v.startsWith(f)))
+    if (feetOver) return { ok: false, dynamic: false }
+    return { ok: true, dynamic: movingExtra > 0.02 }
+  }
+
+  /**
+   * When a planted foot blocks the next hold, drop that foot and smear it
+   * back on from the new hip. A shortfall inside dynamic reach becomes a deadpoint.
+   */
+  rescueHand(
+    moving: 'LH' | 'RH',
+    from: Pose,
+    contacts: Contacts,
+    pr: PoseResult,
+  ): { contacts: Contacts; pose: PoseResult; dynamic: boolean } | null {
+    const holdId = contacts[moving]
+    const hold = holdId ? this.ctx.byId.get(holdId) : undefined
+    if (!hold) return null
+    const root = shoulderPos(from, this.ctx, side(moving))
+    const dist = Math.hypot(hold.x - root.x, hold.y - root.y)
+    // Only the band a deadpoint can still make from the body we already have.
+    if (dist > this.ctx.handReach + this.gain) return null
+    const footReach = this.ctx.footReach
+    const footBlocking = (f: 'LF' | 'RF') => {
+      const over = Math.max(0, (pr.stretch[f] ?? 0) - 1) * footReach
+      return over >= 0.08 || pr.violations.some((v) => v.startsWith(f) && v.includes('high-step'))
+    }
+    const blocked = (['LF', 'RF'] as const).filter(footBlocking)
+    const movingExtra = Math.max(0, (pr.stretch[moving] ?? 0) - 1) * this.ctx.handReach
+    if (blocked.length === 0 && movingExtra <= 0.02) return null
+    let next = contacts
+    let pose = pr
+    if (blocked.length > 0) {
+      for (const f of blocked) next = { ...next, [f]: null }
+      pose = this.pose(next)
+      if (!this.handSlackOk(pose, moving).ok) return null
+      for (const f of blocked) {
+        const other = next[f === 'LF' ? 'RF' : 'LF']
+        const ignore = other?.kind === 'hold' ? other.id : null
+        for (const smear of this.wallSmears(pose.pose, f, this.footYMax(next), ignore)) {
+          const trial: Contacts = { ...next, [f]: smear }
+          const posed = this.pose(trial)
+          if (!this.handSlackOk(posed, moving).ok) continue
+          next = trial
+          pose = posed
+          break
+        }
+      }
+    }
+    const slack = this.handSlackOk(pose, moving)
+    if (!slack.ok) return null
+    if (pose.feasible && blocked.length === 0) return null
+    return { contacts: next, pose, dynamic: slack.dynamic }
+  }
+
+  /** True when matching frees the other hand to take a hold this hand would have to cross for. */
+  opensACross(node: Node, limb: 'LH' | 'RH'): boolean {
+    const { ctx } = this
+    const other = node.contacts[limb === 'LH' ? 'RH' : 'LH']
+    const otherX = other ? ctx.byId.get(other)?.x : null
+    const my = node.contacts[limb] ? ctx.byId.get(node.contacts[limb]!) : undefined
+    if (otherX == null || !my) return false
+    const myY = my.y
+    return ctx.handHolds.some((h) => {
+      if (h.id === other || h.id === my.id || h.y < myY + 0.12) return false
+      const crosses = limb === 'LH' ? h.x > otherX + 0.05 : h.x < otherX - 0.05
+      return crosses
+    })
+  }
+
   /** Evaluate moving one limb; returns the child node or a failure reason. */
   tryMove(node: Node, limb: Limb, target: string | FootContact, penalty: Map<string, number>): Node | string {
     const { ctx } = this
-    const contacts: Contacts = { ...node.contacts, [limb]: target } as Contacts
-    const key = contactsKey(contacts)
+    let contacts: Contacts = { ...node.contacts, [limb]: target } as Contacts
+    let key = contactsKey(contacts)
     if (key === node.key) return 'no change'
-    const pr = this.pose(contacts)
-    if (!pr.feasible) return `out of reach (${pr.violations.join(', ')})`
+    let pr = this.pose(contacts)
+    let dynamicReach = false
+    if (!pr.feasible) {
+      if (!isHand(limb)) return `out of reach (${pr.violations.join(', ')})`
+      const rescued = this.rescueHand(limb, node.pose, contacts, pr)
+      if (!rescued) return `out of reach (${pr.violations.join(', ')})`
+      contacts = rescued.contacts
+      pr = rescued.pose
+      key = contactsKey(contacts)
+      dynamicReach = rescued.dynamic
+      if (key === node.key) return 'no change'
+    }
     const after = evaluateStatics(contacts, pr.pose, ctx)
     if (after.uMax > 1) return `too hard to hold (${Math.round(after.uMax * 100)}% of grip capacity)`
 
@@ -231,6 +387,12 @@ export class Planner {
     const cutting = !isHand(limb) && target === null && !node.contacts[limb === 'LF' ? 'RF' : 'LF']
     let uMid = evaluateStatics(contacts, pr.pose, ctx, limb, cutting ? 1.25 : 1).uMax
     let dynamic = false
+    if (dynamicReach && isHand(limb)) {
+      const p = contactPoint(contacts, limb, ctx)!
+      const root = shoulderPos(node.pose, ctx, side(limb))
+      if (Math.hypot(p.x - root.x, p.y - root.y) > ctx.handReach + this.gain) return 'out of dynamic range'
+      dynamic = true
+    }
     if (uMid > MOVE_LIMIT) {
       if (!isHand(limb) || this.gain <= 0) return `can't let go to move (${Math.round(uMid * 100)}% on the remaining holds)`
       const p = contactPoint(contacts, limb, ctx)!
@@ -255,9 +417,15 @@ export class Planner {
       const prevY = ctx.byId.get(node.contacts[limb]!)?.y ?? 0
       kind = dynamic ? 'dyno' : other === target ? 'match' : crossed ? 'cross' : 'reach'
       cost = 1.0
-      if (crossed) cost += 1.2
+      if (crossed) {
+        const stayed = ctx.byId.get(node.contacts[limb] ?? '')
+        // Matching is the way through when the hold can take two hands. Otherwise a cross is a normal move.
+        cost += stayed?.matchable ? 3.6 : 1.2
+      }
+      if (kind === 'match' && !ctx.finishIds.includes(hold.id)) cost += this.opensACross(node, limb) ? 0.2 : 1.5
       if (hold.y < prevY - 0.1) cost += 0.8
       if (dynamic) cost += 2 + 1.5 * (1 - ctx.profile.power) + (ctx.profile.style === 'dynamic' ? -0.8 : 0)
+      if ((['LF', 'RF'] as const).some((f) => footKey(contacts[f]) !== footKey(node.contacts[f]))) cost += 2.8
       cost += penalty.get(`${limb}:${hold.id}`) ?? 0
       if (prevHands.includes(hold.id) && kind !== 'match') cost += 0.5
     } else {
@@ -276,10 +444,12 @@ export class Planner {
         kind = fy > pr.pose.y - 0.02 ? 'high-step' : 'foot'
         if (kind === 'high-step') cost += 0.9 * (1.2 - ctx.profile.flexibility)
         if (otherFoot && otherFoot.kind === 'hold' && otherFoot.id === f.id) return 'both feet on one hold'
+        const h = ctx.byId.get(f.id)!
+        if (!dedicatedFoot(h) && ctx.footHolds.some((o) => o.id !== h.id && dedicatedFoot(o) && Math.hypot(o.x - h.x, o.y - h.y) < 0.4)) cost += 1.6
       }
       const lp = contactPoint(contacts, 'LF', ctx)
       const rp = contactPoint(contacts, 'RF', ctx)
-      if (lp && rp && lp.x > rp.x + 0.1) cost += 0.6
+      if (lp && rp && lp.x > rp.x + 0.05) cost += 1.8
     }
     const maxStretch = Math.max(...Object.values(pr.stretch).map((s) => s ?? 0))
     if (maxStretch > 0.97) cost += (maxStretch - 0.97) / 0.03
@@ -324,7 +494,11 @@ export class Planner {
       const holds = ctx.footHolds
         .filter((h) => h.y < minHand - 0.12 && h.y >= 0.02)
         .filter((h) => Math.hypot(h.x - hip.x, h.y - hip.y) <= ctx.footReach + 0.85)
-        .sort((a, b) => Math.abs(a.x - hip.x) + Math.abs(a.y - (pose0.y - 0.5 * ctx.dims.leg)) - (Math.abs(b.x - hip.x) + Math.abs(b.y - (pose0.y - 0.5 * ctx.dims.leg))) || a.id.localeCompare(b.id))
+        .sort((a, b) => {
+          const score = (h: (typeof ctx.footHolds)[number]) =>
+            Math.abs(h.x - hip.x) + Math.abs(h.y - (pose0.y - 0.5 * ctx.dims.leg)) + (dedicatedFoot(h) ? -0.7 : 0)
+          return score(a) - score(b) || a.id.localeCompare(b.id)
+        })
         .slice(0, 7)
         .map((h) => ({ kind: 'hold' as const, id: h.id }))
       // One foothold cannot be shared. The other foot smears beside it instead.
@@ -358,13 +532,19 @@ export class Planner {
         }
         const st = evaluateStatics(contacts, pr.pose, ctx)
         const offHold = [lf, rf].filter((f) => f?.kind !== 'hold').length
+        const besideChip = (f: FootContact) => {
+          if (!f || f.kind !== 'hold') return 0
+          const h = ctx.byId.get(f.id)!
+          if (dedicatedFoot(h)) return 0
+          return ctx.footHolds.some((o) => o.id !== h.id && dedicatedFoot(o) && Math.hypot(o.x - h.x, o.y - h.y) < 0.4) ? 2.4 : 0
+        }
         const node: Node = {
           key: contactsKey(contacts),
           contacts,
           pose: pr.pose,
           stretch: pr.stretch,
           statics: st,
-          g: 1.6 * st.uMax ** 2 + offHold * 2.2 + 0.05 * pr.cost,
+          g: 1.6 * st.uMax ** 2 + offHold * 2.2 + besideChip(lf) + besideChip(rf) + 0.05 * pr.cost,
           h: this.heuristic(contacts),
           depth: 0,
           parent: null,
@@ -381,8 +561,10 @@ export class Planner {
     const pool = scored.length > 0 ? scored : overLimit
     if (pool.length === 0 && bestFail) problems.push(bestFail)
     if (scored.length === 0 && pool.length > 0 && bestFail) problems.push(bestFail)
-    pool.sort((a, b) => a.g - b.g || a.key.localeCompare(b.key))
-    return { nodes: pool.slice(0, 4), problems }
+    const uncrossed = pool.filter((n) => !feetCrossed(n.contacts, ctx.byId))
+    const starts = uncrossed.length > 0 ? uncrossed : pool
+    starts.sort((a, b) => a.g - b.g || a.key.localeCompare(b.key))
+    return { nodes: starts.slice(0, 4), problems }
   }
 
   search(penalty: Map<string, number>, deadline: number): { goal: Node | null; best: Node | null } {
@@ -471,6 +653,9 @@ function toBeta(goal: Node, ctx: PlannerContext, id: string, label: string): Bet
     const limb = n.move?.limb ?? null
     const uMid = n.move ? n.move.uMid : null
     const text = describeMove({ kind, limb, contacts: n.contacts, statics: n.statics, uMid, stretch: n.stretch, dynamic: n.move?.dynamic ?? false, ctx })
+    const prev = chain[index - 1]
+    const footFreed =
+      prev && limb && isHand(limb) && (['LF', 'RF'] as const).some((f) => footKey(n.contacts[f]) !== footKey(prev.contacts[f]))
     return {
       index,
       kind,
@@ -483,7 +668,7 @@ function toBeta(goal: Node, ctx: PlannerContext, id: string, label: string): Bet
       dynamic: n.move?.dynamic ?? false,
       title: text.title,
       detail: text.detail,
-      caveats: text.caveats,
+      caveats: footFreed ? [...text.caveats, 'Smeared or flagged a foot to make the reach.'] : text.caveats,
     }
   })
   const effort = (s: BetaStep) => Math.max(s.statics.uMax, s.uMid ?? 0)
