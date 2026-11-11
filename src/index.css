@@ -1,0 +1,10 @@
+@import 'tailwindcss';
+
+:root {
+  color-scheme: dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+input[type='number']::-webkit-inner-spin-button {
+  opacity: 0.4;
+}
