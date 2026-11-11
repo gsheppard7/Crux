@@ -52,7 +52,10 @@ export function limbReach(ctx: PlannerContext, limb: Limb): number {
   return isHand(limb) ? ctx.handReach : ctx.footReach
 }
 
-const highStepLimit = (ctx: PlannerContext) => 0.12 + 0.3 * ctx.profile.flexibility
+/** How far a foot may sit above the hip. Default flexibility ≈ 12 cm — a small rock-over, not a knee-to-chest step. */
+export function highStepLimit(ctx: PlannerContext): number {
+  return 0.04 + 0.16 * ctx.profile.flexibility
+}
 
 export interface PoseResult {
   pose: Pose
@@ -90,7 +93,7 @@ function poseCost(pose: Pose, contacts: Contacts, ctx: PlannerContext, pts: Part
       const hi = p.y - pose.y
       const lim = highStepLimit(ctx)
       if (hi > lim) J += 60 + 400 * (hi - lim) ** 2
-      else if (hi > -0.1) J += 0.6 * (hi + 0.1)
+      else if (hi > -0.22) J += 1.4 * (hi + 0.22)
     }
   }
   if (Math.abs(pose.lean) > MAX_LEAN) J += 60 + 400 * (Math.abs(pose.lean) - MAX_LEAN) ** 2

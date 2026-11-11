@@ -109,6 +109,68 @@ describe('grip and statics model', () => {
 })
 
 describe('beta planner', () => {
+  it('never grabs a foot chip and keeps at least one foot on a hold', () => {
+    const r = ladder(0)
+    const chipped = r.holds.map((h) => (h.type === 'foot-chip' ? { ...h, allowHand: true } : h))
+    const ctx = buildContext({ ...r, holds: chipped }, DEFAULT_CLIMBER)
+    expect(ctx.handHolds.some((h) => h.type === 'foot-chip')).toBe(false)
+    expect(ctx.footHolds.some((h) => h.type === 'foot-chip')).toBe(true)
+
+    const res = planBeta(r, DEFAULT_CLIMBER)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    for (const beta of res.betas) {
+      for (const step of beta.steps) {
+        const hands = [step.contacts.LH, step.contacts.RH].map((id) => (id ? ctx.byId.get(id) : undefined))
+        expect(hands.every((h) => !h || h.type !== 'foot-chip')).toBe(true)
+        const feet = [step.contacts.LF, step.contacts.RF]
+        expect(feet.every((f) => f?.kind === 'hold')).toBe(true)
+        const [lf, rf] = feet
+        if (lf?.kind === 'hold' && rf?.kind === 'hold') expect(lf.id).not.toBe(rf.id)
+      }
+    }
+  })
+
+  it('smears the second foot instead of stacking both on one hold', () => {
+    const r = routeFromMeters(
+      [
+        { id: 's1', x: 1.3, y: 1.6 },
+        { id: 's2', x: 1.7, y: 1.6 },
+        { id: 'fin', x: 1.5, y: 2.6, radius: 0.035 },
+        { id: 'f', x: 1.5, y: 0.7, type: 'edge', radius: 0.02, allowHand: false },
+      ],
+      { start: ['s1', 's2'], finish: ['fin'] },
+    )
+    const res = planBeta(r, DEFAULT_CLIMBER, { maxBetas: 1 })
+    const steps = res.ok ? res.betas[0].steps : res.partial?.steps
+    expect(steps?.[0].kind).toBe('start')
+    for (const step of steps ?? []) {
+      const { LF, RF } = step.contacts
+      if (LF?.kind === 'hold' && RF?.kind === 'hold') expect(LF.id).not.toBe(RF.id)
+    }
+    const start = steps![0].contacts
+    const planted = [start.LF, start.RF].filter((f) => f?.kind === 'hold')
+    const smearing = [start.LF, start.RF].filter((f) => f?.kind === 'smear')
+    expect(planted).toHaveLength(1)
+    expect(smearing).toHaveLength(1)
+  })
+
+  it('still starts when no footholds are marked', () => {
+    const r = routeFromMeters(
+      [
+        { id: 's1', x: 1.3, y: 1.6 },
+        { id: 's2', x: 1.7, y: 1.6 },
+        { id: 'a', x: 1.5, y: 2.3 },
+        { id: 'fin', x: 1.5, y: 3.0, radius: 0.035 },
+      ],
+      { start: ['s1', 's2'], finish: ['fin'] },
+    )
+    const res = planBeta(r, DEFAULT_CLIMBER)
+    if (!res.ok) expect(res.reason).not.toMatch(/holdable start/)
+    const steps = res.ok ? res.betas[0].steps : res.partial?.steps
+    expect(steps?.[0].kind).toBe('start')
+  })
+
   it('climbs a vertical jug ladder and explains each move', () => {
     const res = planBeta(ladder(0), DEFAULT_CLIMBER)
     expect(res.ok, res.ok ? '' : `${res.reason} ${res.diagnostics.join('; ')}`).toBe(true)

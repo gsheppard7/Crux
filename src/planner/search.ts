@@ -1,7 +1,7 @@
 import type { Route } from '../model/schema'
 import { dynamicGain, type ClimberProfile } from '../climber/profile'
 import { buildContext } from './context'
-import { contactPoint, evaluateStatics, hipPos, isHand, shoulderPos, side, solvePose, type PoseResult } from './body'
+import { contactPoint, evaluateStatics, highStepLimit, hipPos, isHand, shoulderPos, side, solvePose, type PoseResult } from './body'
 import { smearEffectiveness } from './grip'
 import { describeMove, effortLabel, holdName } from './explain'
 import type { Beta, BetaStep, Contacts, FootContact, Limb, MoveKind, PlannerContext, PlannerHold, PlanResult, Pose, Statics } from './types'
@@ -41,6 +41,12 @@ interface Node {
   depth: number
   parent: Node | null
   move: Move | null
+}
+
+/** At least one foot on a hold (a volume counts). The other may smear or flag; both on the wall is illegal. */
+function feetLegal(c: Contacts): boolean {
+  const onHold = (f: FootContact) => f?.kind === 'hold'
+  return onHold(c.LF) || onHold(c.RF)
 }
 
 const footKey = (f: FootContact) => (!f ? '-' : f.kind === 'hold' ? `h:${f.id}` : `s:${f.x.toFixed(2)},${f.y.toFixed(2)}`)
@@ -97,25 +103,60 @@ export class Planner {
     const footYs = [c.LF, c.RF].map((f) => (!f ? null : f.kind === 'smear' ? f.y : byId.get(f.id)?.y ?? null)).filter((y): y is number => y !== null)
     const bestFoot = footYs.length ? Math.max(...footYs) : 0
     const footLag = Math.max(0, topHand - bestFoot - (this.ctx.footReach + 0.25))
-    return (1.3 * (0.6 * near + 0.4 * far)) / (0.55 * handReach) + (2 - onFinish) * 0.8 + (1.8 * footLag) / handReach
+    const offHold = [c.LF, c.RF].filter((f) => f?.kind !== 'hold').length
+    return (1.3 * (0.6 * near + 0.4 * far)) / (0.55 * handReach) + (2 - onFinish) * 0.8 + (1.8 * footLag) / handReach + offHold * 1.5
   }
 
-  smearOptions(pose: Pose, limb: 'LF' | 'RF'): FootContact[] {
+  /** Hip height implied by the current hands, so a low foot doesn't drag the step cap down. */
+  naturalHipY(c: Contacts): number {
+    const ys = [c.LH, c.RH].map((id) => (id ? this.ctx.byId.get(id)!.y : null)).filter((y): y is number => y !== null)
+    const lowHand = ys.length ? Math.min(...ys) : 1
+    return lowHand - 0.75 * this.ctx.dims.torso
+  }
+
+  /** Highest a foot may be placed: just above that natural hip, and well under the hands. */
+  footYMax(c: Contacts): number {
+    const topHand = Math.max(...[c.LH, c.RH].map((id) => (id ? this.ctx.byId.get(id)!.y : 0)))
+    return Math.min(this.naturalHipY(c) + highStepLimit(this.ctx), topHand - 0.55)
+  }
+
+  /**
+   * Points on the wall for one foot. `ignoreId` is a hold the other foot already
+   * owns; standing next to it is fine, stacking on it is not.
+   */
+  wallSmears(pose: Pose, limb: 'LF' | 'RF', yMax: number, ignoreId: string | null): FootContact[] {
     if (smearEffectiveness(this.ctx.angleDeg) <= 0) return []
     const s = side(limb)
-    const L = this.ctx.dims.leg
     const out: FootContact[] = []
-    for (const [dx, dy] of [
-      [0.12, -0.55],
-      [0.25, -0.3],
-    ]) {
+    // Use the hip the hands imply when the current pose has collapsed (no feet yet).
+    const baseY = Math.min(yMax, Math.max(pose.y, yMax - 0.05))
+    for (const [dx, drop] of [
+      [0.16, 0.4],
+      [0.28, 0.62],
+    ] as const) {
       const x = q(pose.x + s * dx)
-      const y = q(pose.y + dy * L)
-      if (y < 0.1 || x < 0.05 || x > this.ctx.frame.widthM - 0.05) continue
-      if (this.ctx.holds.some((h) => Math.hypot(h.x - x, h.y - y) < h.r + 0.06)) continue
+      const y = q(Math.max(0.12, baseY - drop))
+      if (y >= yMax || x < 0.05 || x > this.ctx.frame.widthM - 0.05) continue
+      if (this.ctx.footHolds.some((h) => h.id !== ignoreId && Math.hypot(h.x - x, h.y - y) < 0.28)) continue
       out.push({ kind: 'smear', x, y })
     }
     return out
+  }
+
+  /**
+   * Wall smears only when this foot has no hold of its own.
+   * The hold the other foot is on does not count.
+   */
+  smearOptions(pose: Pose, limb: 'LF' | 'RF', contacts: Contacts): FootContact[] {
+    const other = contacts[limb === 'LF' ? 'RF' : 'LF']
+    const taken = other?.kind === 'hold' ? other.id : null
+    const hip = hipPos(pose, this.ctx, side(limb))
+    const yMax = this.footYMax(contacts)
+    const nearby = this.ctx.footHolds.some(
+      (h) => h.id !== taken && h.y <= yMax + 0.02 && h.y >= 0.03 && Math.hypot(h.x - hip.x, h.y - hip.y) <= this.ctx.footReach + 0.35,
+    )
+    if (nearby) return []
+    return this.wallSmears(pose, limb, yMax, taken)
   }
 
   candidates(node: Node, limb: Limb): (string | FootContact)[] {
@@ -141,6 +182,8 @@ export class Planner {
     }
     const cur = c[limb]
     const curId = cur && cur.kind === 'hold' ? cur.id : null
+    const otherFoot = c[limb === 'LF' ? 'RF' : 'LF']
+    const otherFootId = otherFoot?.kind === 'hold' ? otherFoot.id : null
     const hip = hipPos(node.pose, ctx, side(limb))
     const maxHandY = Math.max(...[c.LH, c.RH].map((id) => (id ? ctx.byId.get(id)!.y : 0)))
     // Prefer feet that close the gap under the hands when they lag behind.
@@ -152,17 +195,20 @@ export class Planner {
       }),
     )
     const needUp = maxHandY - bestFootNow > ctx.footReach + 0.25
-    const highStep = 0.12 + 0.3 * ctx.profile.flexibility
-    const idealY = needUp ? Math.min(maxHandY - 0.55, node.pose.y + highStep) : node.pose.y - 0.45 * ctx.dims.leg
+    const yMax = this.footYMax(c)
+    const hipLine = this.naturalHipY(c)
+    const idealY = needUp ? Math.min(yMax, hipLine - 0.05) : hipLine - 0.4 * ctx.dims.leg
     const holds: FootContact[] = ctx.footHolds
-      .filter((h) => h.id !== curId)
-      .filter((h) => h.y >= 0.03 && h.y <= maxHandY - 0.35)
+      .filter((h) => h.id !== curId && h.id !== otherFootId)
+      .filter((h) => h.y >= 0.03 && h.y <= yMax)
       .filter((h) => Math.hypot(h.x - hip.x, h.y - hip.y) <= ctx.footReach + 0.8)
       .sort((a, b) => Math.abs(a.y - idealY) + 0.5 * Math.abs(a.x - hip.x) - (Math.abs(b.y - idealY) + 0.5 * Math.abs(b.x - hip.x)) || a.id.localeCompare(b.id))
       .slice(0, 8)
       .map((h) => ({ kind: 'hold' as const, id: h.id }))
-    const out = [...holds, ...this.smearOptions(node.pose, limb as 'LF' | 'RF')]
-    if (cur) out.push(null)
+    const smears = this.smearOptions(node.pose, limb as 'LF' | 'RF', c)
+    const out = [...holds, ...smears]
+    // Flag only when there is no hold and no wall smear (steep terrain). A smear beats sharing one hold.
+    if (cur && holds.length === 0 && smears.length === 0) out.push(null)
     return out
   }
 
@@ -177,6 +223,11 @@ export class Planner {
     const after = evaluateStatics(contacts, pr.pose, ctx)
     if (after.uMax > 1) return `too hard to hold (${Math.round(after.uMax * 100)}% of grip capacity)`
 
+    if (!isHand(limb) && target && (target as FootContact).kind === 'hold') {
+      const other = contacts[limb === 'LF' ? 'RF' : 'LF']
+      if (other?.kind === 'hold' && other.id === (target as FootContact & { kind: 'hold' }).id) return 'both feet on one hold'
+    }
+    if (!isHand(limb) && !feetLegal(contacts)) return 'at least one foot has to stay on a hold'
     const cutting = !isHand(limb) && target === null && !node.contacts[limb === 'LF' ? 'RF' : 'LF']
     let uMid = evaluateStatics(contacts, pr.pose, ctx, limb, cutting ? 1.25 : 1).uMax
     let dynamic = false
@@ -215,16 +266,16 @@ export class Planner {
       cost = 0.55
       if (!f) {
         kind = otherFoot ? 'flag' : 'cut'
-        cost += otherFoot ? 0.4 : 1.4
+        cost += otherFoot ? 2.4 : 3
       } else if (f.kind === 'smear') {
         kind = 'smear'
-        cost += 0.35
+        // A hold is always better than the wall; smearing is a last resort for one foot.
+        cost += 2.6
       } else {
         const fy = ctx.byId.get(f.id)!.y
-        kind = fy > pr.pose.y - 0.1 ? 'high-step' : 'foot'
-        if (kind === 'high-step') cost += 0.35 * (1.2 - ctx.profile.flexibility)
-        // Foot match / swap on one hold.
-        if (otherFoot && otherFoot.kind === 'hold' && otherFoot.id === f.id) cost += 0.25
+        kind = fy > pr.pose.y - 0.02 ? 'high-step' : 'foot'
+        if (kind === 'high-step') cost += 0.9 * (1.2 - ctx.profile.flexibility)
+        if (otherFoot && otherFoot.kind === 'hold' && otherFoot.id === f.id) return 'both feet on one hold'
       }
       const lp = contactPoint(contacts, 'LF', ctx)
       const rp = contactPoint(contacts, 'RF', ctx)
@@ -232,6 +283,8 @@ export class Planner {
     }
     const maxStretch = Math.max(...Object.values(pr.stretch).map((s) => s ?? 0))
     if (maxStretch > 0.97) cost += (maxStretch - 0.97) / 0.03
+    const offHold = [contacts.LF, contacts.RF].filter((f) => f?.kind !== 'hold').length
+    cost += offHold * 0.85
     cost += 1.6 * after.uMax ** 2 + 1.2 * uMid ** 2
 
     return {
@@ -262,31 +315,41 @@ export class Planner {
 
     let lfOpts: FootContact[]
     let rfOpts: FootContact[]
-    if (footStarts.length > 0) {
+    const minHand = Math.min(chosen[0].y, chosen[chosen.length - 1].y)
+    const opts = (limb: 'LF' | 'RF', preferId?: string): FootContact[] => {
+      const yMax = this.footYMax(handsOnly)
+      if (preferId) return [{ kind: 'hold', id: preferId }, ...this.wallSmears(pose0, limb, yMax, preferId), null]
+      const hip = hipPos(pose0, ctx, side(limb))
+      // Any foothold below the start hands. The pose check drops real high-steps.
+      const holds = ctx.footHolds
+        .filter((h) => h.y < minHand - 0.12 && h.y >= 0.02)
+        .filter((h) => Math.hypot(h.x - hip.x, h.y - hip.y) <= ctx.footReach + 0.85)
+        .sort((a, b) => Math.abs(a.x - hip.x) + Math.abs(a.y - (pose0.y - 0.5 * ctx.dims.leg)) - (Math.abs(b.x - hip.x) + Math.abs(b.y - (pose0.y - 0.5 * ctx.dims.leg))) || a.id.localeCompare(b.id))
+        .slice(0, 7)
+        .map((h) => ({ kind: 'hold' as const, id: h.id }))
+      // One foothold cannot be shared. The other foot smears beside it instead.
+      const reserved = holds.length === 1 && holds[0].kind === 'hold' ? holds[0].id : null
+      const smears = holds.length < 2 ? this.wallSmears(pose0, limb, yMax, reserved) : []
+      return [...holds, ...smears, null]
+    }
+    if (footStarts.length >= 2) {
       const fs = [...footStarts].sort((a, b) => a.x - b.x)
-      lfOpts = [{ kind: 'hold', id: fs[0].id }]
-      rfOpts = fs.length > 1 ? [{ kind: 'hold', id: fs[fs.length - 1].id }] : [null]
+      lfOpts = opts('LF', fs[0].id)
+      rfOpts = opts('RF', fs[fs.length - 1].id)
+    } else if (footStarts.length === 1) {
+      lfOpts = opts('LF', footStarts[0].id)
+      rfOpts = opts('RF')
     } else {
-      const minHand = Math.min(chosen[0].y, chosen[chosen.length - 1].y)
-      const opts = (limb: 'LF' | 'RF'): FootContact[] => {
-        const hip = hipPos(pose0, ctx, side(limb))
-        const holds = ctx.footHolds
-          .filter((h) => h.y < minHand - 0.3 && h.y >= 0.03)
-          .filter((h) => Math.hypot(h.x - hip.x, h.y - hip.y) <= ctx.footReach + 0.5)
-          .sort((a, b) => Math.abs(a.x - hip.x) + Math.abs(a.y - (pose0.y - 0.5 * ctx.dims.leg)) - (Math.abs(b.x - hip.x) + Math.abs(b.y - (pose0.y - 0.5 * ctx.dims.leg))) || a.id.localeCompare(b.id))
-          .slice(0, 7)
-          .map((h) => ({ kind: 'hold' as const, id: h.id }))
-        return [...holds, ...this.smearOptions(pose0, limb), null]
-      }
       lfOpts = opts('LF')
       rfOpts = opts('RF')
     }
 
     const scored: Node[] = []
+    const overLimit: Node[] = []
     let bestFail: string | null = null
     for (const lf of lfOpts) {
       for (const rf of rfOpts) {
-        if (lf && rf && lf.kind === 'hold' && rf.kind === 'hold' && lf.id === rf.id && !ctx.byId.get(lf.id)!.matchable) continue
+        if (lf && rf && lf.kind === 'hold' && rf.kind === 'hold' && lf.id === rf.id) continue
         const contacts: Contacts = { LH, RH, LF: lf, RF: rf }
         const pr = this.pose(contacts)
         if (!pr.feasible) {
@@ -294,28 +357,32 @@ export class Planner {
           continue
         }
         const st = evaluateStatics(contacts, pr.pose, ctx)
-        if (st.uMax > 1) {
-          bestFail = `start position too hard to hold (${Math.round(st.uMax * 100)}% of grip capacity on ${holdName(ctx.byId.get(st.hands.sort((a, b) => b.u - a.u)[0]?.holdId ?? ''))})`
-          continue
-        }
-        const cost = 1.6 * st.uMax ** 2 + (lf ? 0 : 0.5) + (rf ? 0 : 0.5) + 0.05 * pr.cost
-        scored.push({
+        const offHold = [lf, rf].filter((f) => f?.kind !== 'hold').length
+        const node: Node = {
           key: contactsKey(contacts),
           contacts,
           pose: pr.pose,
           stretch: pr.stretch,
           statics: st,
-          g: cost,
+          g: 1.6 * st.uMax ** 2 + offHold * 2.2 + 0.05 * pr.cost,
           h: this.heuristic(contacts),
           depth: 0,
           parent: null,
           move: null,
-        })
+        }
+        if (st.uMax > 1) {
+          bestFail = `start position is hard to hold (${Math.round(st.uMax * 100)}% of grip capacity on ${holdName(ctx.byId.get(st.hands.sort((a, b) => b.u - a.u)[0]?.holdId ?? ''))})`
+          overLimit.push(node)
+          continue
+        }
+        scored.push(node)
       }
     }
-    if (scored.length === 0 && bestFail) problems.push(bestFail)
-    scored.sort((a, b) => a.g - b.g || a.key.localeCompare(b.key))
-    return { nodes: scored.slice(0, 4), problems }
+    const pool = scored.length > 0 ? scored : overLimit
+    if (pool.length === 0 && bestFail) problems.push(bestFail)
+    if (scored.length === 0 && pool.length > 0 && bestFail) problems.push(bestFail)
+    pool.sort((a, b) => a.g - b.g || a.key.localeCompare(b.key))
+    return { nodes: pool.slice(0, 4), problems }
   }
 
   search(penalty: Map<string, number>, deadline: number): { goal: Node | null; best: Node | null } {

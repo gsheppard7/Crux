@@ -24,7 +24,8 @@ export function toPlannerHold(h: Hold, route: Route): PlannerHold {
     type: h.type,
     facingDeg: h.facingDeg,
     difficulty: h.difficulty,
-    hand: h.allowHand,
+    // Foot chips are feet only, even if allowHand was left on.
+    hand: h.allowHand && h.type !== 'foot-chip',
     foot: h.allowFoot,
     matchable: h.type !== 'foot-chip' && (MATCHABLE_TYPES.has(h.type) || 2 * r >= 0.09),
     confidence: h.confidence,
@@ -34,7 +35,7 @@ export function toPlannerHold(h: Hold, route: Route): PlannerHold {
 
 /**
  * Which holds the planner may use:
- *  - hands: in-route holds that allow hands, plus any volume;
+ *  - hands: in-route holds that allow hands, plus any volume; never a foot chip;
  *  - feet: holds that allow feet; with "feet follow hands" only in-route
  *    holds and volumes. The bare wall (smearing) is always available.
  */
