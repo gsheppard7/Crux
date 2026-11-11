@@ -38,6 +38,13 @@ const foot = (key: string, u: number, v: number, radius = 0.012): Spec => ({
   difficulty: 2,
 })
 
+const footEdge = (key: string, u: number, v: number): Spec => ({
+  ...foot(key, u, v, 0.016),
+  type: 'edge',
+  facingDeg: 0,
+  depthCm: 3,
+})
+
 const SAMPLES: SampleDef[] = [
   {
     id: 'sample-tangerine-ladder',
@@ -75,7 +82,7 @@ const SAMPLES: SampleDef[] = [
     name: 'Blue Crimp Traverse',
     grade: 'V4',
     notes:
-      'Rising traverse on a 25° overhang. Feet follow hands: only blue holds for feet. Single matched start on the low crimp, finish on the jug.',
+      'Rising traverse on a 25° overhang. Feet follow hands: only blue holds for feet. Matched start on the low positive edge, finish on the jug.',
     angleDeg: 25,
     wallWidthM: 4.2,
     footRule: 'route-only',
@@ -84,18 +91,22 @@ const SAMPLES: SampleDef[] = [
     baseDark: '#292524',
     seed: 42,
     holds: [
-      { key: 'st', u: 0.17, v: 0.62, radius: 0.022, type: 'crimp', facingDeg: 0, difficulty: 3, depthCm: 2, stretch: 1.4 },
+      { key: 'st', u: 0.17, v: 0.62, radius: 0.026, type: 'edge', facingDeg: 0, difficulty: 2, depthCm: 3, stretch: 1.4 },
       { key: 'b2', u: 0.3, v: 0.55, radius: 0.019, type: 'crimp', facingDeg: 0, difficulty: 3, depthCm: 2, stretch: 1.4 },
-      { key: 'b3', u: 0.43, v: 0.5, radius: 0.024, type: 'pinch', facingDeg: 90, difficulty: 4, depthCm: 5, stretch: 0.7 },
-      { key: 'b4', u: 0.55, v: 0.415, radius: 0.03, type: 'sloper', facingDeg: null, difficulty: 4, depthCm: 6 },
+      { key: 'b3', u: 0.43, v: 0.5, radius: 0.024, type: 'pinch', facingDeg: 90, difficulty: 3, depthCm: 5, stretch: 0.7 },
+      { key: 'b4', u: 0.55, v: 0.415, radius: 0.03, type: 'sloper', facingDeg: null, difficulty: 3, depthCm: 6 },
       { key: 'b5', u: 0.66, v: 0.47, radius: 0.022, type: 'undercling', facingDeg: 180, difficulty: 3, depthCm: 3 },
-      { key: 'b6', u: 0.76, v: 0.355, radius: 0.018, type: 'crimp', facingDeg: 0, difficulty: 4, depthCm: 2, stretch: 1.5 },
+      { key: 'b6', u: 0.76, v: 0.355, radius: 0.018, type: 'crimp', facingDeg: 0, difficulty: 3, depthCm: 2, stretch: 1.5 },
       { key: 'b7', u: 0.86, v: 0.24, radius: 0.021, type: 'edge', facingDeg: 330, difficulty: 3, depthCm: 3 },
       { key: 'fin', u: 0.79, v: 0.115, radius: 0.03, type: 'jug', facingDeg: 0, difficulty: 1, depthCm: 7, stretch: 1.2 },
-      foot('ft1', 0.22, 0.85),
-      foot('ft2', 0.38, 0.795),
-      foot('ft3', 0.57, 0.735),
-      foot('ft4', 0.73, 0.775),
+      footEdge('ft1', 0.12, 0.86),
+      footEdge('ft2', 0.25, 0.81),
+      footEdge('ft3', 0.36, 0.765),
+      footEdge('ft4', 0.47, 0.725),
+      footEdge('ft5', 0.58, 0.695),
+      footEdge('ft6', 0.68, 0.64),
+      footEdge('ft7', 0.78, 0.6),
+      footEdge('ft8', 0.9, 0.55),
     ],
     offRoute: [],
     start: ['st'],
@@ -142,11 +153,12 @@ function buildSample(def: SampleDef): Route {
     createdAt: SAMPLE_DATE,
     updatedAt: SAMPLE_DATE,
     image: { name: `${def.id}.svg`, width: W, height: H, dataUrl },
-    wall: { angleDeg: def.angleDeg, metersPerPixel: def.wallWidthM / W, scaleSource: 'wall-width' },
+    wall: { angleDeg: def.angleDeg, metersPerPixel: def.wallWidthM / W, scaleSource: 'wall-width', floorV: null },
     footRule: def.footRule,
     holds,
     startHoldIds: def.start.map((k) => `${def.id}:${k}`),
     finishHoldIds: def.finish.map((k) => `${def.id}:${k}`),
+    session: null,
   }
 }
 

@@ -1,7 +1,9 @@
 import type { Hold, Route } from '../model/schema'
 import { HOLD_TYPES } from '../model/schema'
 import { holdRole, removeHold, toggleFinish, toggleStart, updateHold } from '../model/route'
-import { normalizedToWall, radiusToImage } from '../model/coords'
+import { radiusToImage, wallFrame } from '../model/coords'
+import { loadClimber } from '../climber/profile'
+import { DEFAULT_DEPTH_CM, holdGripSummary } from '../planner/grip'
 import type { CommitOptions } from '../state/useRouteEditor'
 import { HOLD_TYPE_LABELS, ROLE_COLORS, ROLE_LABELS } from '../ui/theme'
 import { Button, Field, NumberInput, Section, Segmented, TextInput, Toggle, inputClass } from './form'
@@ -41,9 +43,32 @@ export function HoldInspector({ route, hold, apply, onSelect }: Props) {
     apply((r) => updateHold(r, id, patch), { coalesceKey: `edit:${id}:${field}` })
   const isStart = route.startHoldIds.includes(id)
   const isFinish = route.finishHoldIds.includes(id)
-  const mpp = route.wall.metersPerPixel
-  const wall = normalizedToWall(route.image, mpp, hold)
-  const diameterCm = radiusToImage(route.image, hold.radius) * 2 * mpp * 100
+  const frame = wallFrame(route.image, route.wall)
+  const wall = frame.toWall(hold)
+  const diameterCm = radiusToImage(route.image, hold.radius) * 2 * frame.metersPerPixel * 100
+  const climber = loadClimber()
+  const grip = hold.allowHand
+    ? holdGripSummary(
+        {
+          id: hold.id,
+          label: hold.label,
+          x: wall.x,
+          y: wall.y,
+          r: hold.radius * route.image.width * frame.metersPerPixel,
+          depth: (hold.depthCm ?? DEFAULT_DEPTH_CM[hold.type]) / 100,
+          type: hold.type,
+          facingDeg: hold.facingDeg,
+          difficulty: hold.difficulty,
+          hand: hold.allowHand,
+          foot: hold.allowFoot,
+          matchable: false,
+          confidence: hold.confidence,
+          source: hold.source,
+        },
+        climber,
+        route.wall.angleDeg,
+      )
+    : null
 
   return (
     <Section
@@ -89,6 +114,13 @@ export function HoldInspector({ route, hold, apply, onSelect }: Props) {
         <Toggle checked={hold.allowHand} onChange={(allowHand) => apply((r) => updateHold(r, id, { allowHand }))} label="Hands" />
         <Toggle checked={hold.allowFoot} onChange={(allowFoot) => apply((r) => updateHold(r, id, { allowFoot }))} label="Feet" />
       </div>
+
+      {grip && (
+        <div className="rounded-md border border-stone-800 bg-stone-950/50 px-2.5 py-2 text-xs text-stone-400">
+          For {climber.name}: <b className="text-stone-200 capitalize">{grip.rating}</b> ({(grip.capacity * 100).toFixed(0)}% BW one-hand capacity)
+          {!grip.oneHandWithFeet && route.wall.angleDeg > 10 ? ' · not a one-hand rest on this wall' : ''}
+        </div>
+      )}
 
       <Field label="Type">
         {(fid) => (

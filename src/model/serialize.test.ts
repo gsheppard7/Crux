@@ -70,6 +70,8 @@ describe('fixtures', () => {
     const p = parseRouteJson(minimalFixture)
     expect(p.ok).toBe(true)
     if (p.ok) {
+      expect(p.route.schemaVersion).toBe(2)
+      expect(p.route.session).toBe(null)
       expect(p.route.holds).toHaveLength(5)
       expect(p.issues.filter((i) => i.level !== 'info')).toEqual([])
     }

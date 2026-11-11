@@ -172,17 +172,47 @@ export function wallSize(image: Size, metersPerPixel: number): { widthM: number;
 
 /**
  * Normalized image → wall-local meters. Assumes a frontal (fronto-parallel)
- * photo of a planar wall with negligible lens distortion; the photo's bottom
- * edge is treated as the wall base.
+ * photo of a planar wall with negligible lens distortion. `floorV` is the
+ * image row of the wall base (default: the photo's bottom edge).
  */
-export function normalizedToWall(image: Size, metersPerPixel: number, n: Normalized, depthM = 0): WallPoint {
-  const { widthM, heightM } = wallSize(image, metersPerPixel)
-  return { x: n.u * widthM, y: (1 - n.v) * heightM, z: depthM }
+export function normalizedToWall(image: Size, metersPerPixel: number, n: Normalized, depthM = 0, floorV = 1): WallPoint {
+  return { x: n.u * image.width * metersPerPixel, y: (floorV - n.v) * image.height * metersPerPixel, z: depthM }
 }
 
-export function wallToNormalized(image: Size, metersPerPixel: number, p: WallPoint): Normalized {
-  const { widthM, heightM } = wallSize(image, metersPerPixel)
-  return { u: p.x / widthM, v: 1 - p.y / heightM }
+export function wallToNormalized(image: Size, metersPerPixel: number, p: Pick<WallPoint, 'x' | 'y'>, floorV = 1): Normalized {
+  return { u: p.x / (image.width * metersPerPixel), v: floorV - p.y / (image.height * metersPerPixel) }
+}
+
+export interface WallFrame {
+  image: Size
+  metersPerPixel: number
+  angleDeg: number
+  floorV: number
+  widthM: number
+  /** Climbable height: floor line to the top of the photo. */
+  heightM: number
+  toWall: (n: Normalized, z?: number) => WallPoint
+  toNormalized: (p: Pick<WallPoint, 'x' | 'y'>) => Normalized
+}
+
+export function wallFrame(image: Size, wall: { metersPerPixel: number; angleDeg: number; floorV: number | null }): WallFrame {
+  const floorV = wall.floorV ?? 1
+  const mpp = wall.metersPerPixel
+  return {
+    image,
+    metersPerPixel: mpp,
+    angleDeg: wall.angleDeg,
+    floorV,
+    widthM: image.width * mpp,
+    heightM: floorV * image.height * mpp,
+    toWall: (n, z = 0) => normalizedToWall(image, mpp, n, z, floorV),
+    toNormalized: (p) => wallToNormalized(image, mpp, p, floorV),
+  }
+}
+
+/** Calibrate from the real height between the floor line and the photo's top edge. */
+export function metersPerPixelFromFloorHeight(heightM: number, image: Size, floorV: number): number {
+  return heightM / (floorV * image.height)
 }
 
 const deg = (d: number) => (d * Math.PI) / 180

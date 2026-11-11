@@ -25,7 +25,9 @@ export type ParseResult =
  * Upgrade steps keyed by the version they upgrade *from*. Each step receives
  * the raw object at version N and returns it at version N + 1.
  */
-const MIGRATIONS: Record<number, (raw: Record<string, unknown>) => Record<string, unknown>> = {}
+const MIGRATIONS: Record<number, (raw: Record<string, unknown>) => Record<string, unknown>> = {
+  1: (raw) => ({ ...raw, session: raw.session ?? null }),
+}
 
 export function formatZodIssues(error: z.ZodError): string[] {
   return error.issues.slice(0, 20).map((issue) => {

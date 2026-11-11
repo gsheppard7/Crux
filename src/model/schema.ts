@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { ClimbSessionSchema } from './session'
 
 /**
  * Route file format, version 1. See docs/route-schema.md for the full
@@ -7,7 +8,7 @@ import { z } from 'zod'
  * Bump ROUTE_SCHEMA_VERSION on any breaking change and add a migration step
  * in serialize.ts.
  */
-export const ROUTE_SCHEMA_VERSION = 1 as const
+export const ROUTE_SCHEMA_VERSION = 2 as const
 export const ROUTE_FORMAT = 'crux.route' as const
 
 export const HOLD_TYPES = [
@@ -26,7 +27,7 @@ export const HOLD_TYPES = [
 
 export const HOLD_SOURCES = ['manual', 'sample', 'model'] as const
 export const FOOT_RULES = ['open', 'route-only'] as const
-export const SCALE_SOURCES = ['default', 'wall-width', 'reference-hold'] as const
+export const SCALE_SOURCES = ['default', 'wall-width', 'reference-hold', 'floor-height'] as const
 
 const unit = z.number().finite().min(0).max(1)
 
@@ -59,6 +60,12 @@ export const HoldSchema = z.object({
   confidence: unit,
   source: z.enum(HOLD_SOURCES),
   note: z.string().max(500).default(''),
+  /** Observed hold color as #rrggbb (set by auto-detection), or null. */
+  color: z
+    .string()
+    .regex(/^#[0-9a-f]{6}$/i)
+    .nullable()
+    .default(null),
 })
 
 export const RouteImageSchema = z.object({
@@ -76,6 +83,11 @@ export const WallSchema = z.object({
   /** Real-world meters per image pixel, assuming a frontal photo of a planar wall. */
   metersPerPixel: z.number().finite().positive(),
   scaleSource: z.enum(SCALE_SOURCES),
+  /**
+   * Normalized image row where the wall meets the floor / top of the mats.
+   * Wall-local y = 0 there. null = the photo's bottom edge is the floor.
+   */
+  floorV: unit.nullable().default(null),
 })
 
 export const RouteSchema = z.object({
@@ -93,6 +105,8 @@ export const RouteSchema = z.object({
   holds: z.array(HoldSchema),
   startHoldIds: z.array(z.string()),
   finishHoldIds: z.array(z.string()),
+  /** Saved climber, avatar color, and beta plan for this problem. */
+  session: ClimbSessionSchema.nullable().default(null),
 })
 
 export type Hold = z.infer<typeof HoldSchema>

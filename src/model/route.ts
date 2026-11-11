@@ -42,12 +42,18 @@ export function createEmptyRoute(opts: {
       angleDeg: 0,
       metersPerPixel: defaultMetersPerPixel(opts.image),
       scaleSource: 'default',
+      floorV: null,
     },
     footRule: 'open',
     holds: [],
     startHoldIds: [],
     finishHoldIds: [],
+    session: null,
   }
+}
+
+export function setSession(route: Route, session: Route['session']): Route {
+  return { ...route, session }
 }
 
 export function createHold(fields: Partial<Hold> & Pick<Hold, 'u' | 'v'>): Hold {
@@ -67,6 +73,7 @@ export function createHold(fields: Partial<Hold> & Pick<Hold, 'u' | 'v'>): Hold 
     confidence: fields.confidence ?? 1,
     source: fields.source ?? 'manual',
     note: fields.note ?? '',
+    color: fields.color ?? null,
   }
 }
 
@@ -198,6 +205,7 @@ export function replaceImage(route: Route, image: RouteImage, keepHolds: boolean
     next.holds = []
     next.startHoldIds = []
     next.finishHoldIds = []
+    next.wall = { ...next.wall, floorV: null }
   }
   return next
 }

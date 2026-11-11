@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import type { Hold, Route } from '../model/schema'
 import {
   clamp,
@@ -7,18 +7,19 @@ import {
   isInsideImage,
   normalizedToImage,
   normalizedToScreen,
-  normalizedToWall,
   panBy,
   radiusToScreen,
   screenRadiusToNormalized,
   screenToImage,
   viewTransform,
+  wallFrame,
   zoomAt,
   type Point,
   type Size,
   type ViewState,
+  type ViewTransform,
 } from '../model/coords'
-import { addHold, createHold, holdRole, MAX_HOLD_RADIUS, MIN_HOLD_RADIUS, moveHold, updateHold } from '../model/route'
+import { addHold, createHold, holdRole, MAX_HOLD_RADIUS, MIN_HOLD_RADIUS, moveHold, setWall, updateHold } from '../model/route'
 import type { CommitOptions } from '../state/useRouteEditor'
 import { ROLE_COLORS } from '../ui/theme'
 
@@ -33,12 +34,18 @@ interface Props {
   view: ViewState
   onViewChange: (view: ViewState) => void
   apply: (fn: (r: Route) => Route, opts?: CommitOptions) => void
+  /** Optional SVG overlay drawn above holds (e.g. avatar). */
+  overlay?: (t: ViewTransform, image: Size) => ReactNode
+  /** Eyedropper: click samples image color instead of selecting holds. */
+  pickMode?: boolean
+  onPickColor?: (rgb: { r: number; g: number; b: number }, n: { u: number; v: number }) => void
 }
 
 type Gesture =
   | { kind: 'move'; id: string; pointerId: number; start: Point; grab: Point; moved: boolean; session: string }
   | { kind: 'resize'; id: string; pointerId: number; session: string }
   | { kind: 'pan'; pointerId: number; start: Point; startView: ViewState; moved: boolean; deselectOnClick: boolean }
+  | { kind: 'floor'; pointerId: number; session: string }
 
 const DRAG_THRESHOLD_PX = 3
 let sessionCounter = 0
@@ -65,7 +72,19 @@ function useElementSize<T extends HTMLElement>() {
   return [ref, size] as const
 }
 
-export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, view, onViewChange, apply }: Props) {
+export function EditorCanvas({
+  route,
+  selectedId,
+  onSelect,
+  tool,
+  onToolChange,
+  view,
+  onViewChange,
+  apply,
+  overlay,
+  pickMode,
+  onPickColor,
+}: Props) {
   const [containerRef, size] = useElementSize<HTMLDivElement>()
   const svgRef = useRef<SVGSVGElement>(null)
   const gesture = useRef<Gesture | null>(null)
@@ -144,6 +163,11 @@ export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, 
 
   const onHoldPointerDown = (e: ReactPointerEvent, hold: Hold) => {
     if (e.button !== 0 || spaceDown) return
+    if (pickMode) {
+      e.stopPropagation()
+      void sampleColorAt(localPoint(e))
+      return
+    }
     e.stopPropagation()
     onSelect(hold.id)
     const p = localPoint(e)
@@ -170,6 +194,10 @@ export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, 
 
   const onBackgroundPointerDown = (e: ReactPointerEvent) => {
     const p = localPoint(e)
+    if (pickMode && e.button === 0 && !spaceDown) {
+      void sampleColorAt(p)
+      return
+    }
     const wantsPan = e.button === 1 || spaceDown || (e.button === 0 && tool === 'select')
     if (e.button === 0 && tool === 'add' && !spaceDown) {
       // Add + the drag that follows share one undo step.
@@ -220,6 +248,10 @@ export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, 
       const c = normalizedToScreen(t, image, hold)
       const radius = clamp(screenRadiusToNormalized(t, image, Math.hypot(p.x - c.x, p.y - c.y)), MIN_HOLD_RADIUS, MAX_HOLD_RADIUS)
       apply((r) => updateHold(r, g.id, { radius }), { coalesceKey: g.session, sticky: true })
+    } else if (g.kind === 'floor') {
+      const ip = screenToImage(t, p)
+      const n = imageToNormalized(image, ip)
+      apply((r) => setWall(r, { floorV: clamp(n.v, 0.05, 0.98) }), { coalesceKey: g.session, sticky: true })
     }
   }
 
@@ -242,14 +274,35 @@ export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, 
   const imgH = image.height * t.scale
   const cursor = panning ? 'grabbing' : spaceDown ? 'grab' : tool === 'add' ? 'crosshair' : 'default'
 
+  const frame = wallFrame(image, route.wall)
   const hoverInfo = (() => {
     if (!hover) return null
     const ip = screenToImage(t, hover)
     if (!isInsideImage(image, ip)) return null
     const n = imageToNormalized(image, ip)
-    const w = normalizedToWall(image, route.wall.metersPerPixel, n)
+    const w = frame.toWall(n)
     return { n, w }
   })()
+
+  const sampleColorAt = async (p: Point) => {
+    if (!image.dataUrl || !onPickColor) return
+    const ip = screenToImage(t, p)
+    if (!isInsideImage(image, ip)) return
+    const n = imageToNormalized(image, ip)
+    const img = new Image()
+    img.src = image.dataUrl
+    await img.decode()
+    const canvas = document.createElement('canvas')
+    canvas.width = img.naturalWidth
+    canvas.height = img.naturalHeight
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.drawImage(img, 0, 0)
+    const x = clamp(Math.floor(ip.x), 0, canvas.width - 1)
+    const y = clamp(Math.floor(ip.y), 0, canvas.height - 1)
+    const [r, g, b] = ctx.getImageData(x, y, 1, 1).data
+    onPickColor({ r, g, b }, n)
+  }
 
   // Draw the selected hold last so it sits on top.
   const ordered = [...route.holds].sort((a, b) => Number(a.id === selectedId) - Number(b.id === selectedId))
@@ -290,10 +343,17 @@ export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, 
       <svg
         ref={svgRef}
         className="absolute inset-0 h-full w-full touch-none"
-        style={{ cursor }}
+        style={{ cursor: pickMode ? 'crosshair' : cursor }}
         onPointerDown={onBackgroundPointerDown}
         onPointerMove={onPointerMove}
-        onPointerUp={endGesture}
+        onPointerUp={(e) => {
+          const g = gesture.current
+          if (g?.kind === 'floor' && g.pointerId === e.pointerId) {
+            gesture.current = null
+            return
+          }
+          endGesture(e)
+        }}
         onPointerCancel={endGesture}
         onPointerLeave={() => setHover(null)}
         onDoubleClick={onDoubleClick}
@@ -301,6 +361,20 @@ export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, 
         role="application"
         aria-label="Hold annotation canvas"
       >
+        {route.wall.floorV != null && (
+          <FloorLine
+            t={t}
+            image={image}
+            floorV={route.wall.floorV}
+            imgW={imgW}
+            imgH={imgH}
+            disabled={!!spaceDown || !!pickMode}
+            onDragStart={(pointerId, session) => {
+              gesture.current = { kind: 'floor', pointerId, session }
+            }}
+            capture={capture}
+          />
+        )}
         {ordered.map((hold) => {
           const c = normalizedToScreen(t, image, hold)
           const r = Math.max(3, radiusToScreen(t, image, hold.radius))
@@ -375,6 +449,7 @@ export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, 
             </g>
           )
         })}
+        {overlay?.(t, image)}
       </svg>
 
       <div className="absolute top-3 left-3 flex gap-1 rounded-lg border border-stone-700 bg-stone-900/90 p-1 shadow-lg backdrop-blur">
@@ -409,6 +484,51 @@ export function EditorCanvas({ route, selectedId, onSelect, tool, onToolChange, 
         </div>
       )}
     </div>
+  )
+}
+
+function FloorLine({
+  t,
+  image,
+  floorV,
+  imgW,
+  imgH,
+  disabled,
+  onDragStart,
+  capture,
+}: {
+  t: ViewTransform
+  image: Size
+  floorV: number
+  imgW: number
+  imgH: number
+  disabled: boolean
+  onDragStart: (pointerId: number, session: string) => void
+  capture: (e: ReactPointerEvent) => void
+}) {
+  const y = normalizedToScreen(t, image, { u: 0, v: floorV }).y
+  const x0 = t.offsetX
+  const bottom = t.offsetY + imgH
+  return (
+    <g data-testid="floor-line">
+      <rect x={x0} y={y} width={imgW} height={Math.max(0, bottom - y)} fill="#0c0a09" opacity={0.35} />
+      <line
+        x1={x0}
+        y1={y}
+        x2={x0 + imgW}
+        y2={y}
+        stroke="#38bdf8"
+        strokeWidth={2}
+        strokeDasharray="6 4"
+        onPointerDown={(e) => {
+          if (e.button !== 0 || disabled) return
+          e.stopPropagation()
+          onDragStart(e.pointerId, `floor:${++sessionCounter}`)
+          capture(e)
+        }}
+        style={{ cursor: 'ns-resize' }}
+      />
+    </g>
   )
 }
 

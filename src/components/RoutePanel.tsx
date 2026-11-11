@@ -2,10 +2,11 @@ import { useState } from 'react'
 import type { Hold, Route } from '../model/schema'
 import {
   defaultMetersPerPixel,
+  metersPerPixelFromFloorHeight,
   metersPerPixelFromReferenceHold,
   metersPerPixelFromWallWidth,
+  wallFrame,
   wallProfile,
-  wallSize,
 } from '../model/coords'
 import { setMeta, setWall } from '../model/route'
 import type { CommitOptions } from '../state/useRouteEditor'
@@ -30,12 +31,15 @@ const SCALE_LABELS: Record<Route['wall']['scaleSource'], string> = {
   default: 'uncalibrated default',
   'wall-width': 'from visible wall width',
   'reference-hold': 'from a reference hold',
+  'floor-height': 'from wall height above the floor',
 }
 
 export function RoutePanel({ route, selected, apply }: Props) {
-  const { widthM, heightM } = wallSize(route.image, route.wall.metersPerPixel)
+  const frame = wallFrame(route.image, route.wall)
+  const { widthM, heightM } = frame
   const [widthInput, setWidthInput] = useState<number | null>(null)
   const [refCm, setRefCm] = useState<number | null>(null)
+  const [floorHeightM, setFloorHeightM] = useState<number | null>(null)
 
   return (
     <>
@@ -113,8 +117,54 @@ export function RoutePanel({ route, selected, apply }: Props) {
         <div className="rounded-md border border-stone-800 bg-stone-950/60 p-2.5 text-xs text-stone-400">
           Photo covers ≈ <b className="text-stone-200">{widthM.toFixed(2)} × {heightM.toFixed(2)} m</b> of wall ({SCALE_LABELS[route.wall.scaleSource]}).
           <br />
-          {(route.wall.metersPerPixel * 1000).toFixed(2)} mm per image pixel.
+          {(route.wall.metersPerPixel * 1000).toFixed(2)} mm per image pixel
+          {route.wall.floorV == null ? ' · set a floor line for accurate heights' : ` · floor at v=${route.wall.floorV.toFixed(2)}`}.
         </div>
+
+        <Field
+          label="Floor line"
+          hint="Drag the cyan dashed line on the photo, or set/clear it here. Mat below the line is ignored for height."
+        >
+          {() => (
+            <div className="flex flex-wrap gap-2">
+              <Button
+                onClick={() => apply((r) => setWall(r, { floorV: r.wall.floorV ?? 0.88 }))}
+                title="Show a draggable floor line"
+              >
+                {route.wall.floorV == null ? 'Set floor' : 'Reset floor'}
+              </Button>
+              <Button variant="ghost" disabled={route.wall.floorV == null} onClick={() => apply((r) => setWall(r, { floorV: null }))}>
+                Clear
+              </Button>
+            </div>
+          )}
+        </Field>
+
+        <Field
+          label="Calibrate: height above floor (m)"
+          hint={route.wall.floorV == null ? 'Set a floor line first.' : 'Distance from the floor line up to the top of the photo.'}
+        >
+          {(id) => (
+            <div className="flex gap-2">
+              <NumberInput id={id} value={floorHeightM} nullable min={1} max={20} step={0.1} placeholder={heightM.toFixed(2)} onChange={setFloorHeightM} />
+              <Button
+                disabled={floorHeightM === null || route.wall.floorV == null}
+                onClick={() =>
+                  floorHeightM !== null &&
+                  route.wall.floorV != null &&
+                  apply((r) =>
+                    setWall(r, {
+                      metersPerPixel: metersPerPixelFromFloorHeight(floorHeightM, r.image, r.wall.floorV!),
+                      scaleSource: 'floor-height',
+                    }),
+                  )
+                }
+              >
+                Apply
+              </Button>
+            </div>
+          )}
+        </Field>
 
         <Field label="Calibrate: visible wall width (m)" hint="Width of the wall area spanned by the photo's full width.">
           {(id) => (

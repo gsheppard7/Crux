@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Route, RouteImage } from './model/schema'
+import type { Hold, Route, RouteImage } from './model/schema'
 import { fitView, type ViewState } from './model/coords'
 import {
   aspectRatioMismatch,
@@ -12,19 +12,32 @@ import {
   toggleStart,
   updateHold,
   validateRoute,
+  setSession,
+  setWall,
 } from './model/route'
+import { sessionFromParts } from './model/session'
+import type { PlanResult } from './planner/types'
 import { parseRouteJson, routeFileName, serializeRoute } from './model/serialize'
 import { sampleRoutes } from './samples/sampleRoutes'
 import { useRouteEditor } from './state/useRouteEditor'
 import { downloadText, readImageFile } from './lib/imageFile'
+import { loadClimber, saveClimber, type ClimberProfile } from './climber/profile'
+import { deleteClimb, saveClimb } from './lib/library'
+import type { Rgb } from './detect/color'
 import { EditorCanvas, type Tool } from './components/EditorCanvas'
 import { HoldInspector, Kbd } from './components/HoldInspector'
 import { RoutePanel } from './components/RoutePanel'
 import { HoldList } from './components/HoldList'
 import { IssuesPanel } from './components/IssuesPanel'
+import { BetaPanel, type BetaPlayback } from './components/BetaPanel'
+import { ClimberModal } from './components/ClimberModal'
+import { LibraryModal } from './components/LibraryModal'
+import { DetectPanel } from './components/DetectPanel'
+import { AvatarOverlay } from './components/AvatarOverlay'
 import { Modal } from './components/Modal'
 import { Button } from './components/form'
 import { ErrorBoundary } from './components/ErrorBoundary'
+import { loadAvatarColor, saveAvatarColor } from './ui/avatarTheme'
 
 const WallPreview3D = lazy(() => import('./components/WallPreview3D'))
 
@@ -46,9 +59,46 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
   const [importErrors, setImportErrors] = useState<string[] | null>(null)
   const [helpOpen, setHelpOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
+  const [climberOpen, setClimberOpen] = useState(false)
+  const [libraryOpen, setLibraryOpen] = useState(false)
+  const [climber, setClimber] = useState<ClimberProfile>(() => loadClimber())
+  const [avatarColor, setAvatarColor] = useState(() => loadAvatarColor())
+  const [playback, setPlayback] = useState<BetaPlayback>({ beta: null, time: 0, ctx: null })
+  const [pickMode, setPickMode] = useState(false)
+  const [sampledColor, setSampledColor] = useState<Rgb | null>(null)
   const [toast, setToast] = useState<Toast | null>(null)
   const imageInput = useRef<HTMLInputElement>(null)
   const jsonInput = useRef<HTMLInputElement>(null)
+  const onPlayback = useCallback((p: BetaPlayback) => setPlayback(p), [])
+  const saveTimer = useRef<number | null>(null)
+
+  const routeForSave = useMemo(
+    () =>
+      setSession(
+        route,
+        sessionFromParts(
+          climber,
+          avatarColor,
+          (route.session?.plan as PlanResult | null) ?? null,
+          route.session?.betaIndex ?? 0,
+          route.session?.stamp ?? '',
+        ),
+      ),
+    [route, climber, avatarColor],
+  )
+
+  // Debounced library autosave (full bundle: route + session).
+  useEffect(() => {
+    if (saveTimer.current) window.clearTimeout(saveTimer.current)
+    saveTimer.current = window.setTimeout(() => {
+      void saveClimb(routeForSave).catch(() => {
+        /* non-critical */
+      })
+    }, 1200)
+    return () => {
+      if (saveTimer.current) window.clearTimeout(saveTimer.current)
+    }
+  }, [routeForSave])
 
   const selected = getHold(route, selectedId)
   const issues = useMemo(() => validateRoute(route), [route])
@@ -65,13 +115,75 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
     return () => window.clearTimeout(id)
   }, [toast])
 
+  const persistSession = useCallback(
+    (plan: PlanResult | null, betaIndex: number, stamp: string, c: ClimberProfile, color: string) => {
+      apply((r) =>
+        setSession(
+          r,
+          sessionFromParts(c, color, plan, betaIndex, stamp),
+        ),
+      )
+    },
+    [apply],
+  )
+
+  const handlePlanSaved = useCallback(
+    (plan: PlanResult, betaIndex: number, stamp: string) => {
+      persistSession(plan, betaIndex, stamp, climber, avatarColor)
+    },
+    [persistSession, climber, avatarColor],
+  )
+
+  const saveClimbNow = useCallback(async () => {
+    if (routeForSave.session !== route.session) {
+      apply(() => routeForSave)
+    }
+    try {
+      await saveClimb(routeForSave)
+      setToast({
+        message:
+          'Climb saved with photo, holds, wall & scale, climber profile, avatar color, and beta plan (when you have run Find beta).',
+        tone: 'ok',
+      })
+    } catch (e) {
+      setToast({ message: (e as Error).message || 'Save failed', tone: 'error' })
+    }
+  }, [route, routeForSave, apply])
+
   const loadRoute = useCallback(
     (next: Route, message: string) => {
       replace(next)
       setSelectedId(null)
+      if (next.session) {
+        setClimber(next.session.climber)
+        setAvatarColor(next.session.avatarColor)
+        saveClimber(next.session.climber)
+        saveAvatarColor(next.session.avatarColor)
+      }
       setToast({ message, tone: 'ok' })
+      void saveClimb(next).catch(() => {
+        /* non-critical */
+      })
     },
     [replace],
+  )
+
+  const applyDetected = useCallback(
+    (holds: Hold[], floorV: number | null, replaceModelHolds: boolean, meta?: { startHoldIds: string[]; finishHoldIds: string[] }) => {
+      apply((r) => {
+        const kept = replaceModelHolds ? r.holds.filter((h) => h.source !== 'model') : r.holds
+        let next: Route = {
+          ...r,
+          holds: [...kept, ...holds],
+          startHoldIds: meta?.startHoldIds?.length ? meta.startHoldIds : r.startHoldIds,
+          finishHoldIds: meta?.finishHoldIds?.length ? meta.finishHoldIds : r.finishHoldIds,
+        }
+        if (floorV != null) next = setWall(next, { floorV })
+        return next
+      })
+      setToast({ message: `Detected ${holds.length} hold${holds.length === 1 ? '' : 's'} — adjust as needed`, tone: 'ok' })
+    },
+    [apply],
   )
 
   const handleImageFile = useCallback(
@@ -120,7 +232,7 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
   )
 
   const exportRoute = (embedImage: boolean) => {
-    downloadText(routeFileName(route), serializeRoute(route, { embedImage }))
+    downloadText(routeFileName(route), serializeRoute(routeForSave, { embedImage }))
     setExportOpen(false)
     setToast({ message: `Exported ${routeFileName(route)}${embedImage ? '' : ' (without photo)'}`, tone: 'ok' })
   }
@@ -259,6 +371,12 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
           ))}
         </select>
 
+        <Button onClick={() => setLibraryOpen(true)} title="Open saved climbs and samples">
+          Climbs
+        </Button>
+        <Button onClick={() => void saveClimbNow()} title="Save route, photo, climber, avatar color, and beta to this browser’s library">
+          Save climb
+        </Button>
         <Button variant="primary" onClick={() => imageInput.current?.click()} title="Upload a wall photo (or drop one anywhere)">
           {route.image.dataUrl ? 'Upload photo' : 'Attach photo'}
         </Button>
@@ -277,6 +395,10 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
           )}
         </div>
 
+        <div className="mx-1 h-6 w-px bg-stone-700" />
+        <Button variant="ghost" onClick={() => setClimberOpen(true)} title="Edit climber body & strength">
+          Climber
+        </Button>
         <div className="mx-1 h-6 w-px bg-stone-700" />
         <Button variant="ghost" onClick={editor.undo} disabled={!editor.canUndo} title="Undo (⌘Z)">
           ↶ Undo
@@ -365,6 +487,26 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
                 view={view}
                 onViewChange={setView}
                 apply={apply}
+                pickMode={pickMode}
+                onPickColor={(rgb) => {
+                  setSampledColor(rgb)
+                  setPickMode(false)
+                  setToast({ message: 'Sampled hold color from photo', tone: 'ok' })
+                }}
+                overlay={
+                  playback.beta && playback.ctx
+                    ? (t, image) => (
+                        <AvatarOverlay
+                          beta={playback.beta!}
+                          ctx={playback.ctx!}
+                          time={playback.time}
+                          transform={t}
+                          image={image}
+                          avatarColor={avatarColor}
+                        />
+                      )
+                    : undefined
+                }
               />
             </div>
           )}
@@ -389,6 +531,25 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
           className="w-full shrink-0 border-t border-stone-800 bg-stone-900/60 md:w-80 md:overflow-y-auto md:border-t-0 md:border-l xl:w-[360px]"
           aria-label="Inspector"
         >
+          <BetaPanel
+            key={`beta-${route.id}-${route.session?.stamp ?? 'new'}`}
+            route={route}
+            profile={climber}
+            sessionStamp={route.session?.stamp ?? ''}
+            initialPlan={(route.session?.plan as PlanResult | null) ?? null}
+            initialBetaIndex={route.session?.betaIndex ?? 0}
+            onEditClimber={() => setClimberOpen(true)}
+            onPlayback={onPlayback}
+            onPlanSaved={handlePlanSaved}
+          />
+          <DetectPanel
+            route={route}
+            onApply={applyDetected}
+            pickMode={pickMode}
+            onRequestPick={() => setPickMode(true)}
+            sampledColor={sampledColor}
+            onClearSample={() => setSampledColor(null)}
+          />
           <HoldInspector route={route} hold={selected} apply={apply} onSelect={setSelectedId} />
           <HoldList route={route} selectedId={selected?.id ?? null} onSelect={setSelectedId} apply={apply} />
           <RoutePanel route={route} selected={selected} apply={apply} />
@@ -487,9 +648,36 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
             <Shortcut k="⌘Z / ⇧⌘Z">Undo / redo</Shortcut>
             <Shortcut k="Esc">Deselect</Shortcut>
           </dl>
-          <p className="text-stone-500">Drop a photo or a .crux.json file anywhere to open it.</p>
+          <p className="text-stone-500">Drop a photo or a .crux.json file anywhere to open it. Use Find beta in the sidebar to simulate a sequence.</p>
         </Modal>
       )}
+
+      {climberOpen && (
+        <ClimberModal
+          profile={climber}
+          avatarColor={avatarColor}
+          onSave={(p, color) => {
+            setClimber(p)
+            setAvatarColor(color)
+            saveClimber(p)
+            saveAvatarColor(color)
+          }}
+          onClose={() => setClimberOpen(false)}
+        />
+      )}
+
+      <LibraryModal
+        open={libraryOpen}
+        onClose={() => setLibraryOpen(false)}
+        onLoad={(r, message) => {
+          loadRoute(r, message)
+          setLibraryOpen(false)
+        }}
+        onDelete={async (id) => {
+          await deleteClimb(id)
+          setToast({ message: 'Climb removed from library', tone: 'warn' })
+        }}
+      />
     </div>
   )
 }
