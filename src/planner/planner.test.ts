@@ -4,9 +4,9 @@ import type { Hold, Route } from '../model/schema'
 import { bodyDims, DEFAULT_CLIMBER, dynamicGain, inchesToM, type ClimberProfile } from '../climber/profile'
 import { sampleRoutes } from '../samples/sampleRoutes'
 import { skeletonFromPose } from '../avatar/skeleton'
-import { buildContext } from './context'
-import { evaluateStatics, solvePose, stanceGate } from './body'
-import { directionFactor, handCapacity, holdGripSummary } from './grip'
+import { buildContext, canStandOn } from './context'
+import { evaluateStatics, flagPoint, solvePose, stanceGate } from './body'
+import { directionFactor, handCapacity, holdGripSummary, supportAlignment } from './grip'
 import { PRE_CHANGE_BASELINE } from './baseline.snapshot'
 import { Planner, isMantle, planBeta, tacticCost } from './search'
 import type { Contacts, Statics } from './types'
@@ -71,6 +71,10 @@ describe('grip and statics model', () => {
     expect(directionFactor(crimp, { x: 0, y: 1 })).toBeCloseTo(0.15) // pulling upward off it
     const sidepullFacingLeft = { type: 'sidepull' as const, facingDeg: 270 }
     expect(directionFactor(sidepullFacingLeft, { x: 1, y: 0 })).toBeCloseTo(1) // body to the right
+    const diagonal = { type: 'edge' as const, facingDeg: 45 }
+    expect(supportAlignment(45, { x: -1, y: -1 })).toBeGreaterThan(0.95)
+    expect(supportAlignment(45, { x: 0, y: -1 })).toBeLessThan(0.75)
+    expect(directionFactor(diagonal, { x: -1, y: -1 })).toBeGreaterThan(directionFactor(diagonal, { x: 0, y: -1 }) * 1.35)
   })
 
   it('a jug is "good" and a hard crimp on an overhang is not', () => {
@@ -173,6 +177,119 @@ describe('beta planner', () => {
     expect(steps?.[0].kind).toBe('start')
   })
 
+  it('keeps feet uncrossed when each side has a foothold', () => {
+    const r = routeFromMeters(
+      [
+        { id: 's1', x: 1.2, y: 1.55 },
+        { id: 's2', x: 1.8, y: 1.55 },
+        { id: 'a', x: 1.5, y: 2.35 },
+        { id: 'fin', x: 1.5, y: 3.15, radius: 0.04 },
+        { id: 'fl', x: 1.1, y: 0.4, type: 'foot-chip', radius: 0.012, allowHand: false },
+        { id: 'fr', x: 1.9, y: 0.45, type: 'foot-chip', radius: 0.012, allowHand: false },
+        { id: 'baitL', x: 1.25, y: 1.2, type: 'foot-chip', radius: 0.012, allowHand: false },
+        { id: 'baitR', x: 1.75, y: 1.2, type: 'foot-chip', radius: 0.012, allowHand: false },
+      ],
+      { start: ['s1', 's2'], finish: ['fin'] },
+    )
+    const ctx = buildContext(r, DEFAULT_CLIMBER)
+    const res = planBeta(r, DEFAULT_CLIMBER, { maxBetas: 1, timeBudgetMs: 5000 })
+    expect(res.ok, res.ok ? '' : res.reason).toBe(true)
+    if (!res.ok) return
+    const xOf = (id: string | null) => (id ? ctx.byId.get(id)?.x ?? null : null)
+    for (const step of res.betas[0].steps) {
+      const lf = step.contacts.LF
+      const rf = step.contacts.RF
+      const lx = lf?.kind === 'hold' ? xOf(lf.id) : lf?.kind === 'smear' ? lf.x : null
+      const rx = rf?.kind === 'hold' ? xOf(rf.id) : rf?.kind === 'smear' ? rf.x : null
+      if (lx != null && rx != null) expect(lx).toBeLessThanOrEqual(rx + 0.05)
+    }
+  })
+
+  it('does not stand on an undercling or a downward-facing hold', () => {
+    expect(canStandOn({ type: 'undercling', facingDeg: 180 })).toBe(false)
+    expect(canStandOn({ type: 'edge', facingDeg: 180 })).toBe(false)
+    expect(canStandOn({ type: 'jug', facingDeg: 0 })).toBe(true)
+    expect(canStandOn({ type: 'volume', facingDeg: 180 })).toBe(true)
+    const r = routeFromMeters(
+      [
+        { id: 's', x: 1.5, y: 1.5, type: 'jug' },
+        { id: 'u', x: 1.5, y: 1.0, type: 'undercling', facingDeg: 180, allowFoot: true },
+        { id: 'e', x: 1.6, y: 0.6, type: 'edge', facingDeg: 0, allowHand: false },
+      ],
+      { start: ['s'], finish: ['s'] },
+    )
+    const ctx = buildContext(r, DEFAULT_CLIMBER)
+    expect(ctx.footHolds.map((h) => h.id)).not.toContain('u')
+    expect(ctx.footHolds.map((h) => h.id)).toContain('e')
+    expect(ctx.byId.get('u')?.patches.some((p) => p.role === 'foot-edge')).toBe(false)
+  })
+
+  it('flags each foot on its own side and keeps steps below the hands', () => {
+    const r = routeFromMeters(
+      [
+        { id: 's1', x: 1.3, y: 1.6 },
+        { id: 's2', x: 1.7, y: 1.6 },
+      ],
+      { start: ['s1', 's2'], finish: ['s2'] },
+    )
+    const ctx = buildContext(r, DEFAULT_CLIMBER)
+    const pose = { x: 1.5, y: 1.15, lean: 0, stance: 'flag-outside-L' as const }
+    const left = flagPoint(pose, ctx, 'LF')
+    const right = flagPoint({ ...pose, stance: 'flag-outside-R' }, ctx, 'RF')
+    expect(left.x).toBeLessThan(pose.x - 0.1)
+    expect(right.x).toBeGreaterThan(pose.x + 0.1)
+    expect(left.y).toBeLessThan(pose.y - 0.3)
+    expect(right.y).toBeLessThan(pose.y - 0.3)
+    const planner = new Planner(ctx, { beamWidth: 8, perHandPair: 2, maxDepth: 4, maxBetas: 1, timeBudgetMs: 1000 })
+    const cap = planner.footYMax({ LH: 's1', RH: 's2', LF: null, RF: null })
+    expect(cap).toBeLessThan(1.6 - 0.15)
+    expect(cap).toBeGreaterThan(1.2)
+  })
+
+  it('steps the right foot out and gives its hold to the left foot', () => {
+    const r = routeFromMeters(
+      [
+        { id: 's1', x: 1.3, y: 1.7 },
+        { id: 's2', x: 1.7, y: 1.7 },
+        { id: 'wasRight', x: 1.25, y: 0.7, type: 'edge', allowHand: false, radius: 0.016 },
+        { id: 'left', x: 1.05, y: 0.65, type: 'edge', allowHand: false, radius: 0.016 },
+        { id: 'out', x: 1.85, y: 0.72, type: 'edge', allowHand: false, radius: 0.016 },
+      ],
+      { start: ['s1', 's2'], finish: ['s2'] },
+    )
+    const ctx = buildContext(r, DEFAULT_CLIMBER)
+    const planner = new Planner(ctx, { beamWidth: 8, perHandPair: 2, maxDepth: 4, maxBetas: 1, timeBudgetMs: 1000 })
+    const pose = solvePose(
+      { LH: 's1', RH: 's2', LF: { kind: 'hold', id: 'left' }, RF: { kind: 'hold', id: 'wasRight' } },
+      ctx,
+    ).pose
+    const node = {
+      key: 't',
+      contacts: { LH: 's1', RH: 's2', LF: { kind: 'hold' as const, id: 'left' }, RF: { kind: 'hold' as const, id: 'wasRight' } },
+      pose: { ...pose, x: 1.5 },
+      stretch: {},
+      statics: evaluateStatics(
+        { LH: 's1', RH: 's2', LF: { kind: 'hold', id: 'left' }, RF: { kind: 'hold', id: 'wasRight' } },
+        { ...pose, x: 1.5 },
+        ctx,
+      ),
+      g: 0,
+      h: 0,
+      depth: 0,
+      parent: null,
+      move: null,
+    }
+    const swaps = planner.footSwaps(node)
+    const stepped = swaps.find((c) => c.RF?.kind === 'hold' && c.RF.id === 'out' && c.LF?.kind === 'hold' && c.LF.id === 'wasRight')
+    expect(stepped).toBeTruthy()
+    const crossed = swaps.find((c) => {
+      const lx = c.LF?.kind === 'hold' ? ctx.byId.get(c.LF.id)?.x : null
+      const rx = c.RF?.kind === 'hold' ? ctx.byId.get(c.RF.id)?.x : null
+      return lx != null && rx != null && lx > rx
+    })
+    expect(crossed).toBeUndefined()
+  })
+
   it('matches instead of crossing, and prefers a nearby foothold', () => {
     const r = routeFromMeters(
       [
@@ -220,10 +337,20 @@ describe('beta planner', () => {
   it('returns distinct alternatives when they exist', () => {
     const res = planBeta(ladder(0), DEFAULT_CLIMBER)
     expect(res.ok && res.betas.length).toBeGreaterThanOrEqual(2)
-    if (res.ok && res.betas.length >= 2) {
-      const seq = (i: number) => res.betas[i].steps.map((s) => `${s.limb}:${s.limb ? JSON.stringify(s.contacts[s.limb]) : ''}`).join()
-      expect(seq(0)).not.toBe(seq(1))
-    }
+    if (!res.ok || res.betas.length < 2) return
+    const hands = (i: number) =>
+      res.betas[i].steps
+        .filter((s) => s.limb === 'LH' || s.limb === 'RH')
+        .map((s) => `${s.limb}:${s.contacts[s.limb as 'LH' | 'RH']}`)
+        .join()
+    const feet = (i: number) =>
+      res.betas[i].steps
+        .flatMap((s) => [s.contacts.LF, s.contacts.RF])
+        .map((f) => (f?.kind === 'hold' ? f.id : f?.kind ?? '-'))
+        .join()
+    expect(hands(0) !== hands(1) || feet(0) !== feet(1)).toBe(true)
+    expect(new Set(res.betas.map((b) => b.label))).toHaveLength(res.betas.length)
+    expect(res.betas[0].label).toMatch(/Straight/)
   })
 
   it('finishes a hold that is only a short reach past the planted feet', () => {

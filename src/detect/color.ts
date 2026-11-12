@@ -186,31 +186,28 @@ export function matchesNamedColor(rgb: Rgb, name: NamedColorName): boolean {
     case 'brown':
       return s >= 0.18 && s <= 0.7 && v >= 0.15 && v <= 0.55 && inHue(h, 10, 45)
     case 'red':
-      // Saturated red/orange-red; exclude light pinks and magenta-leaning pinks.
-      if (!(s >= 0.35 && v >= 0.18 && v <= 0.92 && inHue(h, 345, 18))) return false
-      if (v > 0.72 && s < 0.55) return false // light dusty → pink
-      if (inHue(h, 320, 345) && v > 0.55) return false
+      // Saturated red/orange-red, including shade. Light pinks stay pink.
+      if (!(s >= 0.28 && v >= 0.12 && v <= 0.95 && inHue(h, 345, 16))) return false
+      if (v > 0.75 && s < 0.55) return false
       return true
     case 'pink': {
-      if (v < 0.35) return false
-      // Magenta–rose band (not saturated crimson).
-      if (inHue(h, 300, 345) && s >= 0.15 && s <= 0.95 && v >= 0.4) return true
-      // Pastel / light reddish only — keep saturated reds out.
-      if (inHue(h, 345, 20) && s >= 0.15 && s < 0.7 && v > 0.72) return true
+      if (v < 0.22 || s < 0.12) return false
+      if (inHue(h, 300, 345) && s <= 0.95) return true
+      if (inHue(h, 345, 20) && s < 0.65 && v > 0.55) return true
       return false
     }
     case 'orange':
-      return s >= 0.35 && v >= 0.35 && inHue(h, 15, 42)
+      return s >= 0.28 && v >= 0.16 && inHue(h, 14, 42)
     case 'yellow':
-      return s >= 0.3 && v >= 0.45 && inHue(h, 42, 72)
+      return s >= 0.22 && v >= 0.28 && inHue(h, 40, 75)
     case 'green':
-      return s >= 0.25 && v >= 0.2 && inHue(h, 72, 160)
+      return s >= 0.18 && v >= 0.1 && inHue(h, 75, 165)
     case 'teal':
-      return s >= 0.25 && v >= 0.25 && inHue(h, 160, 195)
+      return s >= 0.18 && v >= 0.12 && inHue(h, 158, 198)
     case 'blue':
-      return s >= 0.25 && v >= 0.2 && inHue(h, 195, 255)
+      return s >= 0.16 && v >= 0.08 && inHue(h, 195, 258)
     case 'purple':
-      return s >= 0.25 && v >= 0.2 && inHue(h, 255, 300)
+      return s >= 0.16 && v >= 0.1 && inHue(h, 255, 305)
     default:
       return false
   }
@@ -219,6 +216,34 @@ export function matchesNamedColor(rgb: Rgb, name: NamedColorName): boolean {
 /** Eyedropper match: Lab ΔE ≤ tolerance against the sampled RGB. */
 export function matchesEyedropper(sample: Rgb, pixel: Rgb, tolerance: number): boolean {
   return deltaE(rgbToLab(sample), rgbToLab(pixel)) <= tolerance
+}
+
+/** Smallest angle between two hues, in degrees. */
+export function hueDistance(a: number, b: number): number {
+  const d = Math.abs(a - b) % 360
+  return Math.min(d, 360 - d)
+}
+
+/**
+ * Photo-friendly color match. Gym holds shift a lot in lightness (highlights,
+ * shadows, tape glare) while staying in the same hue. Chromatic samples match
+ * on hue with a wide value window. Neutral samples (black, white, gray, wood)
+ * match on lightness and low chroma.
+ */
+export function matchesSample(sample: Rgb, pixel: Rgb, tolerance = 18): boolean {
+  const s = rgbToHsv(sample)
+  const p = rgbToHsv(pixel)
+  const hueTol = Math.max(14, Math.min(28, tolerance * 0.95))
+  const sampleNeutral = s.s < 0.16
+  const pixelNeutral = p.s < 0.2
+  if (sampleNeutral) {
+    if (!pixelNeutral && p.s > 0.28) return false
+    return Math.abs(s.v - p.v) <= 0.22 + tolerance / 90
+  }
+  if (pixelNeutral || p.s < Math.min(0.14, s.s * 0.4)) return false
+  if (hueDistance(s.h, p.h) > hueTol) return false
+  if (p.v < 0.07) return false
+  return true
 }
 
 export function meanRgb(pixels: Rgb[]): Rgb {

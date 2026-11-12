@@ -12,6 +12,18 @@ export const HIP_WALL_OFFSET = 0.18
 
 const MATCHABLE_TYPES = new Set(['jug', 'volume', 'sloper'])
 
+/**
+ * A foot needs a surface it can press down on. An undercling, or any hold
+ * whose lip faces downward, has nothing to stand on. Volumes still do.
+ */
+export function canStandOn(hold: { type: string; facingDeg: number | null }): boolean {
+  if (hold.type === 'undercling') return false
+  if (hold.type === 'volume') return true
+  if (hold.facingDeg == null) return true
+  const f = ((hold.facingDeg % 360) + 360) % 360
+  return f <= 115 || f >= 245
+}
+
 export function toPlannerHold(h: Hold, route: Route): PlannerHold {
   const frame = wallFrame(route.image, route.wall)
   const p = frame.toWall(h)
@@ -28,7 +40,7 @@ export function toPlannerHold(h: Hold, route: Route): PlannerHold {
     difficulty: h.difficulty,
     // Foot chips are feet only, even if allowHand was left on.
     hand: h.allowHand && h.type !== 'foot-chip',
-    foot: h.allowFoot,
+    foot: h.allowFoot && canStandOn(h),
     matchable: h.type !== 'foot-chip' && (MATCHABLE_TYPES.has(h.type) || 2 * r >= 0.09),
     confidence: h.confidence,
     source: h.source,

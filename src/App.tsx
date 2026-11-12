@@ -5,11 +5,13 @@ import {
   aspectRatioMismatch,
   createEmptyRoute,
   getHold,
+  duplicateHold,
   removeHold,
   replaceImage,
   toggleFinish,
   toggleInRoute,
   toggleStart,
+  moveHold,
   updateHold,
   validateRoute,
   setSession,
@@ -238,15 +240,16 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
   }
 
   // Keyboard shortcuts.
-  const latest = useRef({ selectedId, route })
+  const latest = useRef({ selectedId, route, tool })
+  const clipboardId = useRef<string | null>(null)
   useEffect(() => {
-    latest.current = { selectedId, route }
+    latest.current = { selectedId, route, tool }
   })
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (isTypingTarget(e.target)) return
       const mod = e.metaKey || e.ctrlKey
-      const { selectedId, route } = latest.current
+      const { selectedId, route, tool } = latest.current
       const sel = getHold(route, selectedId)
       if (mod && e.key.toLowerCase() === 'z') {
         e.preventDefault()
@@ -259,6 +262,31 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
         editor.redo()
         return
       }
+      if (mod && e.key.toLowerCase() === 'c') {
+        if (!sel) return
+        e.preventDefault()
+        clipboardId.current = sel.id
+        return
+      }
+      if (mod && e.key.toLowerCase() === 'v') {
+        const src = clipboardId.current
+        if (!src) return
+        e.preventDefault()
+        const image = route.image
+        const du = 28 / image.width
+        const dv = 28 / image.height
+        let pasted: string | null = null
+        apply((r) => {
+          const result = duplicateHold(r, src, { du, dv })
+          pasted = result.id
+          return result.route
+        })
+        if (pasted) {
+          clipboardId.current = pasted
+          setSelectedId(pasted)
+        }
+        return
+      }
       if (mod || e.altKey) return
       switch (e.key) {
         case 'v':
@@ -268,6 +296,10 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
         case 'a':
         case 'A':
           setTool('add')
+          return
+        case 'o':
+        case 'O':
+          setTool('outline')
           return
         case '0':
           setView(fitView(route.image))
@@ -285,6 +317,7 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
       switch (e.key) {
         case 'Delete':
         case 'Backspace':
+          if (tool === 'outline') return
           e.preventDefault()
           apply((r) => removeHold(r, id))
           setSelectedId(null)
@@ -315,9 +348,10 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
           const px = e.shiftKey ? 10 : 1
           const du = e.key === 'ArrowLeft' ? -px : e.key === 'ArrowRight' ? px : 0
           const dv = e.key === 'ArrowUp' ? -px : e.key === 'ArrowDown' ? px : 0
-          apply((r) => updateHold(r, id, { u: sel.u + du / r.image.width, v: sel.v + dv / r.image.height }), {
-            coalesceKey: `nudge:${id}`,
-          })
+          apply(
+            (r) => moveHold(r, id, { u: sel.u + du / r.image.width, v: sel.v + dv / r.image.height }),
+            { coalesceKey: `nudge:${id}` },
+          )
           return
         }
       }
@@ -635,8 +669,9 @@ export default function App({ initialRoute }: { initialRoute?: () => Route }) {
       {helpOpen && (
         <Modal title="Shortcuts & gestures" onClose={() => setHelpOpen(false)}>
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
-            <Shortcut k="A / V">Add-hold tool / select tool</Shortcut>
-            <Shortcut k="Click">Add tool: place a hold (drag to adjust)</Shortcut>
+            <Shortcut k="A / O / V">Circle hold / outline hold / select</Shortcut>
+            <Shortcut k="Click">Add: place a circle. Outline: add a corner; Enter or click the first point to finish</Shortcut>
+            <Shortcut k="⌘C / ⌘V">Copy the selected hold and paste a duplicate of its shape and size</Shortcut>
             <Shortcut k="Double-click">Select tool: add a hold</Shortcut>
             <Shortcut k="Drag hold">Move it · drag the white handle to resize</Shortcut>
             <Shortcut k="Drag photo">Pan (or hold Space / middle mouse)</Shortcut>

@@ -95,7 +95,9 @@ export function derivePatches(hold: Pick<PlannerHold, 'type' | 'facingDeg' | 'de
   }
   const out: ContactPatch[] = []
   if (hold.hand) out.push(patch('hand', 'hand', hold, 0, 0, hold.depth * 0.35, shape.nz, shape.cone))
-  if (hold.foot && hold.type !== 'pinch') out.push(patch('foot', 'foot-edge', hold, 0, -hold.r * 0.15, hold.depth * 0.25, Math.min(0.55, shape.nz + 0.1), shape.cone))
+  if (hold.foot && hold.type !== 'pinch' && hold.type !== 'undercling') {
+    out.push(patch('foot', 'foot-edge', hold, 0, -hold.r * 0.15, hold.depth * 0.25, Math.min(0.55, shape.nz + 0.1), shape.cone))
+  }
   if (lip && hold.hand) out.push(patch('heel', 'heel', hold, 0, hold.r * 0.35, hold.depth * 0.5, 0.3, 36, Math.max(0.03, hold.r)))
   return out
 }

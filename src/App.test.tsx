@@ -36,7 +36,7 @@ describe('App', () => {
   it('adds a hold with the Add tool and deletes it with the keyboard', async () => {
     const user = userEvent.setup()
     render(<App initialRoute={sample} />)
-    await user.click(screen.getByRole('button', { name: '+ Add hold' }))
+    await user.click(screen.getByRole('button', { name: '+ Circle' }))
     const canvas = screen.getByRole('application', { name: 'Hold annotation canvas' })
     fireEvent.pointerDown(canvas, { clientX: 400, clientY: 300, button: 0, pointerId: 1 })
     fireEvent.pointerUp(canvas, { clientX: 400, clientY: 300, button: 0, pointerId: 1 })

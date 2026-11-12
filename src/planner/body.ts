@@ -1,4 +1,4 @@
-import { footEffectiveness, gripDirectionFactor, handCapacity, handShare } from './grip'
+import { footEffectiveness, gripDirectionFactor, handCapacity, handShare, holdNeedsLip, supportAlignment } from './grip'
 import { footPatch, handPatch, holdIdOf, parseRef, patchCanOppose } from './patches'
 import type { ContactPatch } from '../model/schema'
 import type { Contacts, FootLimb, HandLimb, HandLoad, Limb, PlannerContext, Pose, StanceId, Statics } from './types'
@@ -102,12 +102,17 @@ export function hipPos(pose: Pose, ctx: PlannerContext, s: -1 | 1): Vec2 {
   return { x: pose.x + s * w * Math.cos(yaw), y: pose.y - drop - s * w * Math.sin(yaw) }
 }
 
-/** Where an outside flag presses, on the free leg's own side. */
+/**
+ * Outside flag: on this leg's own side of the body, and well below the hip
+ * so the foot stays under the arms instead of crossing in front of them.
+ */
 export function flagPoint(pose: Pose, ctx: PlannerContext, limb: FootLimb): Vec2 {
   const s = side(limb)
   const hip = hipPos({ ...pose, stance: 'square' }, ctx, s)
-  const reach = 0.55 * ctx.dims.leg
-  return { x: hip.x + s * reach, y: hip.y - 0.2 * ctx.dims.leg }
+  const out = Math.max(0.16, ctx.dims.hipWidth * 0.85)
+  const x = s < 0 ? Math.min(pose.x - out, hip.x - 0.04) : Math.max(pose.x + out, hip.x + 0.04)
+  const y = hip.y - 0.62 * ctx.dims.leg
+  return { x, y: Math.max(0.05, y) }
 }
 
 export function centerOfMass(pose: Pose, ctx: PlannerContext): Vec2 {
@@ -197,8 +202,17 @@ function poseCost(pose: Pose, contacts: Contacts, ctx: PlannerContext, pts: Part
       const hold = ref ? ctx.byId.get(ref.id) : undefined
       if (hold) {
         const spot = handPatch(hold, contacts[limb])
-        const pull = { x: root.x - p.x, y: root.y - p.y, z: shoulderGap(pose.stance) - contactDepth(contacts, limb, ctx) }
+        const com = centerOfMass(pose, ctx)
+        const z = shoulderGap(pose.stance) - contactDepth(contacts, limb, ctx)
+        const shoulder = { x: root.x - p.x, y: root.y - p.y }
+        const pull = holdNeedsLip(hold.type)
+          ? { x: (com.x - p.x) * 0.75 + shoulder.x * 0.25, y: (com.y - p.y) * 0.75 + shoulder.y * 0.25, z }
+          : { x: shoulder.x, y: shoulder.y, z }
         J += 1.5 * (1 - gripDirectionFactor(hold, pull, spot))
+        if (hold.facingDeg !== null && holdNeedsLip(hold.type)) {
+          const align = supportAlignment(hold.facingDeg, { x: com.x - p.x, y: com.y - p.y })
+          J += 14 * Math.max(0, 0.8 - align) ** 2
+        }
       }
     } else {
       nFeet++
@@ -414,7 +428,11 @@ export function evaluateStatics(contacts: Contacts, pose: Pose, ctx: PlannerCont
       const stretch = Math.hypot(p.x - root.x, p.y - root.y) / limbReach(ctx, limb, pose)
       const w = matched ? 0.5 : raw[i] / total
       const load = share * amplify * w
-      const pull = { x: root.x - p.x, y: root.y - p.y, z: shoulderGap(pose.stance) - contactDepth(c, limb, ctx) }
+      const zGap = shoulderGap(pose.stance) - contactDepth(c, limb, ctx)
+      const shoulder = { x: root.x - p.x, y: root.y - p.y }
+      const pull = holdNeedsLip(hold.type)
+        ? { x: (com.x - p.x) * 0.75 + shoulder.x * 0.25, y: (com.y - p.y) * 0.75 + shoulder.y * 0.25, z: zGap }
+        : { x: shoulder.x, y: shoulder.y, z: zGap }
       const capacity = handCapacity(hold, ctx.profile, ctx.angleDeg, pull, stretch, spot)
       hands.push({ limb, holdId: hold.id, load, capacity, u: load / capacity })
     })

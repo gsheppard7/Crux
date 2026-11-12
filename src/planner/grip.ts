@@ -76,13 +76,31 @@ const sinPos = (deg: number) => Math.sin((Math.max(0, deg) * Math.PI) / 180)
  * in the wall plane (x right, y up). The ideal pull is opposite the
  * surface normal: a jug facing up wants the body below it.
  */
+/** Edges, crimps, sidepulls, and underclings only hold weight near their lip. Jugs forgive a wider angle. */
+export function holdNeedsLip(type: HoldType): boolean {
+  return type === 'edge' || type === 'crimp' || type === 'sidepull' || type === 'undercling' || type === 'pocket'
+}
+
+/**
+ * How well `fromHold` (body minus hold, x right, y up) sits on the side the
+ * hold can support. 1 means the weight is straight against the lip. A hold
+ * facing up-and-right wants the body down-and-left.
+ */
+export function supportAlignment(facingDeg: number | null, fromHold: { x: number; y: number }): number {
+  if (facingDeg === null) return 1
+  const len = Math.hypot(fromHold.x, fromHold.y)
+  if (len < 1e-4) return 0
+  const f = (facingDeg * Math.PI) / 180
+  return (-Math.sin(f) * fromHold.x - Math.cos(f) * fromHold.y) / len
+}
+
 export function directionFactor(hold: Pick<PlannerHold, 'type' | 'facingDeg'>, pull: { x: number; y: number } | null): number {
   if (hold.facingDeg === null || !pull) return 1
   const len = Math.hypot(pull.x, pull.y)
   if (len < 1e-6) return 1
-  const f = (hold.facingDeg * Math.PI) / 180
-  const c = (-(Math.sin(f) * pull.x) - Math.cos(f) * pull.y) / len
-  const a = Math.pow((c + 1) / 2, 1.5)
+  const c = supportAlignment(hold.facingDeg, pull)
+  const exp = holdNeedsLip(hold.type) ? 2.6 : 1.5
+  const a = Math.pow((c + 1) / 2, exp)
   const floor = DIRECTION_FLOOR[hold.type]
   return floor + (1 - floor) * a
 }

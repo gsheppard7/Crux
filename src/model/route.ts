@@ -74,6 +74,7 @@ export function createHold(fields: Partial<Hold> & Pick<Hold, 'u' | 'v'>): Hold 
     source: fields.source ?? 'manual',
     note: fields.note ?? '',
     color: fields.color ?? null,
+    outline: fields.outline ?? null,
     patches: fields.patches ?? null,
   }
 }
@@ -111,6 +112,12 @@ export function updateHold(route: Route, id: string, patch: Partial<Omit<Hold, '
     next.radius = clamp(next.radius, MIN_HOLD_RADIUS, MAX_HOLD_RADIUS)
     next.confidence = clamp(next.confidence, 0, 1)
     next.facingDeg = normalizeFacing(next.facingDeg)
+    if (next.outline) {
+      const pts = next.outline
+        .filter((p) => Number.isFinite(p.u) && Number.isFinite(p.v))
+        .map((p) => ({ u: clamp(p.u, 0, 1), v: clamp(p.v, 0, 1) }))
+      next.outline = pts.length >= 3 ? pts : null
+    }
     if (next.difficulty !== null) next.difficulty = clamp(Math.round(next.difficulty), 1, 5)
     if (next.depthCm !== null) next.depthCm = clamp(next.depthCm, 0, 200)
     return next
@@ -130,7 +137,36 @@ export function updateHold(route: Route, id: string, patch: Partial<Omit<Hold, '
 }
 
 export function moveHold(route: Route, id: string, to: { u: number; v: number }): Route {
-  return updateHold(route, id, to)
+  const hold = getHold(route, id)
+  if (!hold) return route
+  const du = to.u - hold.u
+  const dv = to.v - hold.v
+  return updateHold(route, id, {
+    u: to.u,
+    v: to.v,
+    outline: hold.outline?.map((p) => ({ u: p.u + du, v: p.v + dv })) ?? null,
+  })
+}
+
+/** Copy a hold, including its outline, shifted so the paste is not on top of the original. */
+export function duplicateHold(
+  route: Route,
+  id: string,
+  offset: { du: number; dv: number } = { du: 0.03, dv: 0.03 },
+): { route: Route; id: string | null } {
+  const hold = getHold(route, id)
+  if (!hold) return { route, id: null }
+  const copy = createHold({
+    ...hold,
+    id: createId('h'),
+    label: '',
+    u: hold.u + offset.du,
+    v: hold.v + offset.dv,
+    outline: hold.outline?.map((p) => ({ u: p.u + offset.du, v: p.v + offset.dv })) ?? null,
+    source: 'manual',
+    confidence: 1,
+  })
+  return { route: addHold(route, copy), id: copy.id }
 }
 
 export function removeHold(route: Route, id: string): Route {

@@ -23,7 +23,7 @@ import { addHold, createHold, holdRole, MAX_HOLD_RADIUS, MIN_HOLD_RADIUS, moveHo
 import type { CommitOptions } from '../state/useRouteEditor'
 import { ROLE_COLORS } from '../ui/theme'
 
-export type Tool = 'select' | 'add'
+export type Tool = 'select' | 'add' | 'outline'
 
 interface Props {
   route: Route
@@ -91,6 +91,7 @@ export function EditorCanvas({
   const [spaceDown, setSpaceDown] = useState(false)
   const [panning, setPanning] = useState(false)
   const [hover, setHover] = useState<Point | null>(null)
+  const [draft, setDraft] = useState<{ u: number; v: number }[]>([])
   const image = route.image
   const t = viewTransform(size, image, view)
 
@@ -148,6 +149,72 @@ export function EditorCanvas({
     }
   }
 
+  useEffect(() => {
+    if (tool !== 'outline') setDraft([])
+  }, [tool])
+
+  const closeOutline = useCallback(() => {
+    if (draft.length < 3) return
+    let su = 0
+    let sv = 0
+    for (const p of draft) {
+      su += p.u
+      sv += p.v
+    }
+    const u = su / draft.length
+    const v = sv / draft.length
+    const aspect = image.height / Math.max(1, image.width)
+    let reach = MIN_HOLD_RADIUS
+    for (const p of draft) {
+      reach = Math.max(reach, Math.hypot(p.u - u, (p.v - v) * aspect))
+    }
+    const hold = createHold({
+      u,
+      v,
+      radius: reach,
+      outline: draft,
+      source: 'manual',
+      confidence: 1,
+    })
+    apply((r) => addHold(r, hold))
+    onSelect(hold.id)
+    setDraft([])
+    onToolChange('select')
+  }, [apply, draft, image.height, image.width, onSelect, onToolChange])
+
+  const addOutlinePoint = useCallback(
+    (p: Point) => {
+      const imgPt = screenToImage(t, p)
+      if (!isInsideImage(image, imgPt)) return
+      const n = imageToNormalized(image, imgPt)
+      if (draft.length >= 3) {
+        const first = normalizedToScreen(t, image, draft[0]!)
+        if (Math.hypot(p.x - first.x, p.y - first.y) <= 12) {
+          closeOutline()
+          return
+        }
+      }
+      setDraft((pts) => [...pts, n])
+    },
+    [closeOutline, draft, image, t],
+  )
+
+  useEffect(() => {
+    if (tool !== 'outline') return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLElement && (e.target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName))) return
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        closeOutline()
+      } else if (e.key === 'Backspace' && draft.length > 0) {
+        e.preventDefault()
+        setDraft((pts) => pts.slice(0, -1))
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [closeOutline, draft.length, tool])
+
   const addAt = useCallback(
     (p: Point, opts?: CommitOptions): string | null => {
       const imgPt = screenToImage(t, p)
@@ -163,6 +230,11 @@ export function EditorCanvas({
 
   const onHoldPointerDown = (e: ReactPointerEvent, hold: Hold) => {
     if (e.button !== 0 || spaceDown) return
+    if (tool === 'outline') {
+      e.stopPropagation()
+      addOutlinePoint(localPoint(e))
+      return
+    }
     if (pickMode) {
       e.stopPropagation()
       void sampleColorAt(localPoint(e))
@@ -196,6 +268,10 @@ export function EditorCanvas({
     const p = localPoint(e)
     if (pickMode && e.button === 0 && !spaceDown) {
       void sampleColorAt(p)
+      return
+    }
+    if (e.button === 0 && tool === 'outline' && !spaceDown) {
+      addOutlinePoint(p)
       return
     }
     const wantsPan = e.button === 1 || spaceDown || (e.button === 0 && tool === 'select')
@@ -394,17 +470,35 @@ export function EditorCanvas({
             >
               <circle cx={c.x} cy={c.y} r={Math.max(r, 10)} fill="transparent" />
               {selected && <circle cx={c.x} cy={c.y} r={r + 5} fill="none" stroke="#fff" strokeOpacity={0.9} strokeWidth={2} />}
-              <circle
-                cx={c.x}
-                cy={c.y}
-                r={r}
-                fill={color}
-                fillOpacity={selected ? 0.22 : 0.08}
-                stroke={color}
-                strokeWidth={selected ? 3 : 2.25}
-                strokeDasharray={dash}
-                style={{ filter: 'drop-shadow(0 0 2px rgba(0,0,0,.9))' }}
-              />
+              {hold.outline && hold.outline.length >= 3 ? (
+                <polygon
+                  points={hold.outline
+                    .map((p) => {
+                      const s = normalizedToScreen(t, image, p)
+                      return `${s.x},${s.y}`
+                    })
+                    .join(' ')}
+                  fill={color}
+                  fillOpacity={selected ? 0.28 : 0.16}
+                  stroke={color}
+                  strokeWidth={selected ? 3 : 2.25}
+                  strokeLinejoin="round"
+                  strokeDasharray={dash}
+                  style={{ filter: 'drop-shadow(0 0 2px rgba(0,0,0,.9))' }}
+                />
+              ) : (
+                <circle
+                  cx={c.x}
+                  cy={c.y}
+                  r={r}
+                  fill={color}
+                  fillOpacity={selected ? 0.22 : 0.08}
+                  stroke={color}
+                  strokeWidth={selected ? 3 : 2.25}
+                  strokeDasharray={dash}
+                  style={{ filter: 'drop-shadow(0 0 2px rgba(0,0,0,.9))' }}
+                />
+              )}
               {role === 'start-finish' && (
                 <circle cx={c.x} cy={c.y} r={r + 3} fill="none" stroke={ROLE_COLORS.finish} strokeWidth={2} strokeDasharray="5 3" />
               )}
@@ -449,6 +543,26 @@ export function EditorCanvas({
             </g>
           )
         })}
+        {draft.length > 0 && (
+          <g data-testid="outline-draft">
+            <polyline
+              points={draft
+                .map((p) => {
+                  const s = normalizedToScreen(t, image, p)
+                  return `${s.x},${s.y}`
+                })
+                .join(' ')}
+              fill="none"
+              stroke="#fbbf24"
+              strokeWidth={2}
+              strokeDasharray="4 3"
+            />
+            {draft.map((p, i) => {
+              const s = normalizedToScreen(t, image, p)
+              return <circle key={i} cx={s.x} cy={s.y} r={i === 0 ? 6 : 3.5} fill={i === 0 ? '#fbbf24' : '#fff'} stroke="#0c0a09" strokeWidth={1} />
+            })}
+          </g>
+        )}
         {overlay?.(t, image)}
       </svg>
 
@@ -456,10 +570,18 @@ export function EditorCanvas({
         <ToolButton active={tool === 'select'} onClick={() => onToolChange('select')} title="Select / move (V). Drag background to pan; double-click to add.">
           Select
         </ToolButton>
-        <ToolButton active={tool === 'add'} onClick={() => onToolChange('add')} title="Add holds (A). Click to place, drag to adjust.">
-          + Add hold
+        <ToolButton active={tool === 'add'} onClick={() => onToolChange('add')} title="Add holds (A). Click to place a circle, drag to adjust.">
+          + Circle
+        </ToolButton>
+        <ToolButton active={tool === 'outline'} onClick={() => onToolChange('outline')} title="Outline a hold (O). Click corners, then Enter or click the first point.">
+          Outline
         </ToolButton>
       </div>
+      {tool === 'outline' && (
+        <div className="absolute top-14 left-3 rounded-md border border-stone-700 bg-stone-900/90 px-2 py-1 text-[11px] text-stone-300">
+          Click corners of the hold. Enter finishes ({draft.length} point{draft.length === 1 ? '' : 's'}). Backspace removes the last point.
+        </div>
+      )}
 
       <div className="absolute top-3 right-3 flex items-center gap-1 rounded-lg border border-stone-700 bg-stone-900/90 p-1 text-sm shadow-lg backdrop-blur">
         <ToolButton onClick={() => zoomBy(1 / 1.25)} title="Zoom out">−</ToolButton>

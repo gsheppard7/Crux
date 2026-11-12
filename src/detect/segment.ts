@@ -1,7 +1,8 @@
 import {
   deltaE,
-  matchesEyedropper,
+  labToRgb,
   matchesNamedColor,
+  matchesSample,
   meanRgb,
   medianLab,
   rgbToHex,
@@ -39,6 +40,14 @@ export interface SegmentComponent {
   solidity: number
   /** True when the blob matched the target color filter. */
   isTarget: boolean
+  /** Simplified silhouette in normalized image coords. */
+  outline: { u: number; v: number }[]
+  /**
+   * Brightness-weighted centroid minus geometric centroid, in downscaled
+   * pixels. Positive x is right; positive y is down. A lip highlight shifts
+   * this toward the usable edge.
+   */
+  lightBias: { x: number; y: number }
   /** Optional binary mask of the downscaled component (row-major). */
   maskPreview?: Uint8Array
 }
@@ -224,51 +233,84 @@ export function detectFloorV(data: ImageData, wallLab: Lab): number | null {
 
 function matchesTarget(rgb: Rgb, color: ColorTarget): boolean {
   if (color.kind === 'named') return matchesNamedColor(rgb, color.name)
-  return matchesEyedropper(color.rgb, rgb, color.tolerance)
+  return matchesSample(color.rgb, rgb, color.tolerance)
 }
 
-function morphCloseOpen(mask: Uint8Array, W: number, H: number): void {
-  const dilate = (src: Uint8Array): Uint8Array => {
-    const dst = new Uint8Array(src.length)
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        let on = 0
-        for (let dy = -1; dy <= 1 && !on; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const nx = x + dx
-            const ny = y + dy
-            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue
-            if (src[ny * W + nx]) on = 1
-          }
-        }
-        dst[y * W + x] = on
+/**
+ * Flood from color seeds into adjacent pixels of the same hue that are still
+ * off the wall. Caps the grow distance so a cast across the plywood cannot
+ * swallow the panel.
+ */
+function growTargets(
+  data: ImageData,
+  fg: Uint8Array,
+  targetMask: Uint8Array,
+  floorRow: number,
+  wallLab: Lab,
+  growGate: number,
+  color: ColorTarget,
+): void {
+  const W = data.width
+  const maxSteps = 5
+  const q: number[] = []
+  const dist = new Int16Array(fg.length)
+  dist.fill(-1)
+  for (let i = 0; i < fg.length; i++) {
+    if (!targetMask[i]) continue
+    dist[i] = 0
+    q.push(i)
+  }
+  let head = 0
+  while (head < q.length) {
+    const idx = q[head++]!
+    const d0 = dist[idx]!
+    if (d0 >= maxSteps) continue
+    const x = idx % W
+    const y = (idx / W) | 0
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue
+        const nx = x + dx
+        const ny = y + dy
+        if (nx < 0 || ny < 0 || nx >= W || ny >= floorRow) continue
+        const ni = ny * W + nx
+        if (dist[ni] !== -1) continue
+        const pi = ni * 4
+        if (data.data[pi + 3]! < 128) continue
+        const rgb = pixelRgb(data.data, pi)
+        if (deltaE(rgbToLab(rgb), wallLab) < growGate) continue
+        if (!matchesTarget(rgb, color)) continue
+        dist[ni] = d0 + 1
+        fg[ni] = 1
+        targetMask[ni] = 1
+        q.push(ni)
       }
     }
-    return dst
   }
-  const erode = (src: Uint8Array): Uint8Array => {
-    const dst = new Uint8Array(src.length)
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        let on = 1
-        for (let dy = -1; dy <= 1 && on; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const nx = x + dx
-            const ny = y + dy
-            if (nx < 0 || ny < 0 || nx >= W || ny >= H || !src[ny * W + nx]) on = 0
-          }
+}
+
+/** Fill only tiny interior gaps (a highlight or bolt hole), not a region the size of the wall. */
+function fillHoles(mask: Uint8Array, W: number, floorRow: number): void {
+  const next = mask.slice()
+  for (let y = 0; y < floorRow; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y * W + x
+      if (mask[idx]) continue
+      let on = 0
+      let tot = 0
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const nx = x + dx
+          const ny = y + dy
+          if (nx < 0 || ny < 0 || nx >= W || ny >= floorRow) continue
+          tot++
+          if (mask[ny * W + nx]) on++
         }
-        dst[y * W + x] = on
       }
+      if (tot > 0 && on / tot >= 0.75) next[idx] = 1
     }
-    return dst
   }
-  // close then open
-  let m = dilate(mask)
-  m = erode(m)
-  m = erode(m)
-  m = dilate(m)
-  mask.set(m)
+  mask.set(next)
 }
 
 interface RawBlob {
@@ -344,6 +386,45 @@ function polygonArea(poly: { x: number; y: number }[]): number {
   return Math.abs(a) / 2
 }
 
+/** Radial silhouette: farthest boundary pixel in each angular bin. */
+function radialOutline(
+  pixels: { x: number; y: number }[],
+  cx: number,
+  cy: number,
+  W: number,
+  H: number,
+  inside: Uint8Array,
+): { u: number; v: number }[] {
+  const bins = 24
+  const best: { x: number; y: number; r2: number }[] = []
+  for (let i = 0; i < bins; i++) best.push({ x: cx, y: cy, r2: -1 })
+  for (const p of pixels) {
+    const idx = p.y * W + p.x
+    let edge = false
+    for (let dy = -1; dy <= 1 && !edge; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue
+        const nx = p.x + dx
+        const ny = p.y + dy
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H || !inside[ny * W + nx]) edge = true
+      }
+    }
+    if (!edge) continue
+    const dx = p.x - cx
+    const dy = p.y - cy
+    let ang = Math.atan2(dy, dx)
+    if (ang < 0) ang += Math.PI * 2
+    const bin = Math.min(bins - 1, Math.floor((ang / (Math.PI * 2)) * bins))
+    const r2 = dx * dx + dy * dy
+    if (r2 > best[bin]!.r2) best[bin] = { x: p.x, y: p.y, r2 }
+  }
+  const pts = best.filter((b) => b.r2 > 0).map((b) => ({
+    u: (b.x + 0.5) / W,
+    v: (b.y + 0.5) / H,
+  }))
+  return pts.length >= 6 ? pts : []
+}
+
 function shapeStats(pixels: { x: number; y: number }[]): {
   orientation: number
   elongation: number
@@ -406,9 +487,13 @@ export function segmentHolds(
   const warnings: string[] = []
   const { data, scale, sourceWidth, sourceHeight } = downscaleToImageData(source)
   const { width: W, height: H } = data
-  const labs = sampleCenterLabs(data)
-  const wallLab = medianLab(labs)
-  const mad = madOfDeltas(labs, wallLab)
+  const labs = sampleCenterLabs(data).filter((lab) => {
+    const rgb = labToRgb(lab)
+    return !matchesTarget(rgb, options.color)
+  })
+  const wallLabs = labs.length >= 30 ? labs : sampleCenterLabs(data)
+  const wallLab = medianLab(wallLabs)
+  const mad = madOfDeltas(wallLabs, wallLab)
   // Higher sensitivity → lower ΔE threshold → more foreground.
   const sens = Math.max(0, Math.min(1, options.sensitivity))
   const T = Math.max(6, 2.2 * mad) * (1.55 - 0.95 * sens)
@@ -421,32 +506,38 @@ export function segmentHolds(
   const targetMask = new Uint8Array(W * H)
   const includeOther = options.includeOtherColors === true
 
+  // Seeds must match the chosen color and sit clearly off the wall. Growth
+  // then fills only the connected shaded parts of those holds, so a tinted
+  // wall cannot become one component.
+  const wallGate = Math.max(9, T * 0.8)
+  const growGate = Math.max(7, T * 0.55)
   for (let y = 0; y < floorRow; y++) {
     for (let x = 0; x < W; x++) {
       const i = (y * W + x) * 4
       if (data.data[i + 3]! < 128) continue
       const rgb = pixelRgb(data.data, i)
       const d = deltaE(rgbToLab(rgb), wallLab)
-      if (d <= T) continue
       const idx = y * W + x
-      const isT = matchesTarget(rgb, options.color)
-      if (isT) {
+      if (matchesTarget(rgb, options.color) && d >= wallGate) {
         fg[idx] = 1
         targetMask[idx] = 1
-      } else if (includeOther) {
+      } else if (includeOther && d > T) {
         fg[idx] = 1
       }
     }
   }
 
-  morphCloseOpen(fg, W, H)
-  // Keep targetMask only where fg survived morphology
+  growTargets(data, fg, targetMask, floorRow, wallLab, growGate, options.color)
+  // Fill small holes inside a hold. Do not open, which erases thin holds,
+  // and do not dilate across the wall.
+  fillHoles(fg, W, floorRow)
   for (let i = 0; i < fg.length; i++) {
     if (!fg[i]) targetMask[i] = 0
   }
 
   const minArea = Math.max(12, 0.00006 * W * H)
-  const maxArea = 0.15 * W * H
+  // A real hold, even a volume, is a small fraction of the photo.
+  const maxArea = 0.04 * W * H
   const raw = connectedComponents(fg, targetMask, W, H)
   const components: SegmentComponent[] = []
 
@@ -456,7 +547,12 @@ export function segmentHolds(
       // ok
     }
     const area = blob.pixels.length
-    if (area < minArea || area > maxArea) continue
+    if (area < minArea || area > maxArea) {
+      if (blob.isTarget && area > maxArea) {
+        warnings.push('Dropped a wall-sized color region; it was not treated as a hold.')
+      }
+      continue
+    }
     // Prefer target; drop tiny non-target noise more aggressively
     if (!blob.isTarget && area < minArea * 2) continue
 
@@ -465,15 +561,39 @@ export function segmentHolds(
     let maxX = 0
     let maxY = 0
     const colors: Rgb[] = []
+    let lSum = 0
+    let lx = 0
+    let ly = 0
+    const inside = new Uint8Array(W * H)
     for (const p of blob.pixels) {
+      inside[p.y * W + p.x] = 1
       if (p.x < minX) minX = p.x
       if (p.y < minY) minY = p.y
       if (p.x > maxX) maxX = p.x
       if (p.y > maxY) maxY = p.y
       const i = (p.y * W + p.x) * 4
-      colors.push(pixelRgb(data.data, i))
+      const rgb = pixelRgb(data.data, i)
+      const onTarget = targetMask[p.y * W + p.x] === 1
+      if (onTarget || !blob.isTarget) colors.push(rgb)
+      const lum = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b
+      lSum += lum
+      lx += lum * p.x
+      ly += lum * p.y
+    }
+    if (colors.length === 0) {
+      for (const p of blob.pixels) colors.push(pixelRgb(data.data, (p.y * W + p.x) * 4))
     }
     const stats = shapeStats(blob.pixels)
+    const bw = maxX - minX + 1
+    const bh = maxY - minY + 1
+    // Speckle that morphology or a color cast joined across the wall.
+    if (bw > W * 0.38 && bh > H * 0.28) continue
+    if (blob.isTarget && area > 0.012 * W * H && stats.solidity < 0.45) continue
+    const outline = radialOutline(blob.pixels, stats.cx, stats.cy, W, H, inside)
+    const lightBias = {
+      x: lSum > 0 ? lx / lSum - stats.cx : 0,
+      y: lSum > 0 ? ly / lSum - stats.cy : 0,
+    }
     // Map centroid to original normalized coords
     const u = (stats.cx + 0.5) / W
     const v = (stats.cy + 0.5) / H
@@ -486,6 +606,8 @@ export function segmentHolds(
       elongation: stats.elongation,
       solidity: stats.solidity,
       isTarget: blob.isTarget,
+      outline,
+      lightBias,
     })
   }
 

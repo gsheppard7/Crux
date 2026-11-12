@@ -170,7 +170,12 @@ export function skeletonFromPose(contacts: Contacts, pose: Pose, ctx: PlannerCon
       target = footTarget(ctx, contacts, limb, pose) ?? danglingFoot(ctx, pose, limb)
     }
     const dropKnee = (pose.stance === 'drop-knee-L' && limb === 'LF') || (pose.stance === 'drop-knee-R' && limb === 'RF')
-    const pole = dropKnee ? add(root, { x: side(limb) * 0.15, y: -1, z: 0.15 }) : add(root, { x: side(limb) * 0.9, y: 0.1, z: 0.8 })
+    const flagging = !contacts[limb]
+    const pole = dropKnee
+      ? add(root, { x: side(limb) * 0.15, y: -1, z: 0.15 })
+      : flagging
+        ? add(root, { x: side(limb) * 0.85, y: -0.7, z: 0.25 })
+        : add(root, { x: side(limb) * 0.9, y: 0.1, z: 0.8 })
     const ik = twoBoneIk(root, target, dims.thigh, dims.shank, pole)
     if (ik.stretch > 1.005) overstretched.push(limb)
     return ik

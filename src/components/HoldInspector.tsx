@@ -32,7 +32,7 @@ export function HoldInspector({ route, hold, apply, onSelect }: Props) {
     return (
       <Section title="Selected hold">
         <p className="text-sm text-stone-400">
-          Select a hold on the photo or in the list. Use <Kbd>A</Kbd> to add holds, or double-click the photo.
+          Select a hold on the photo or in the list. <Kbd>A</Kbd> adds a circle, <Kbd>O</Kbd> draws an outline. <Kbd>⌘C</Kbd> <Kbd>⌘V</Kbd> copies the selected hold’s shape and size.
         </p>
       </Section>
     )

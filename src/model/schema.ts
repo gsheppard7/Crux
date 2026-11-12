@@ -89,6 +89,16 @@ export const HoldSchema = z.object({
     .nullable()
     .default(null),
   /**
+   * Detected silhouette in normalized image coords, around the centroid.
+   * Null for manual holds, which stay circles of `radius`.
+   */
+  outline: z
+    .array(z.object({ u: unit, v: unit }))
+    .min(3)
+    .max(48)
+    .nullable()
+    .default(null),
+  /**
    * Optional contact spots. Null means the planner derives them from type,
    * facing, radius, and depth. Cones and normals are estimates.
    */

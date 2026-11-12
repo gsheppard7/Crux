@@ -19,6 +19,9 @@ function handSpots(h: PlannerHold): string[] {
   return hands.map((p) => handTarget(h, p.id))
 }
 
+/** How a repeat search is biased so the next beta is a different plan, not the same sequence. */
+export type BetaStrategy = 'straight' | 'outside' | 'feet-up'
+
 /** Soft preferences on top of the move cost. Straight arms are not a universal rule. */
 export function tacticCost(
   pose: Pose,
@@ -122,6 +125,7 @@ const q = (v: number) => Math.round(v / 0.05) * 0.05
 export class Planner {
   private poseCache = new Map<string, PoseResult>()
   expanded = 0
+  strategy: BetaStrategy = 'straight'
   private readonly gain: number
   readonly finishTop: number
 
@@ -171,10 +175,12 @@ export class Planner {
       return hid && finishIds.includes(hid)
     }).length
     // Feet left far below the hands will have to come up before the next big move.
-    const topHand = Math.max(...[c.LH, c.RH].map((id) => (id ? lookup(this.ctx, id)!.y : 0)))
+    const handYs = [c.LH, c.RH].map((id) => (id ? lookup(this.ctx, id)!.y : null)).filter((y): y is number => y !== null)
+    const lowHand = handYs.length ? Math.min(...handYs) : 0
     const footYs = [c.LF, c.RF].map((f) => (!f ? null : f.kind === 'smear' ? f.y : lookup(this.ctx, f.id)?.y ?? null)).filter((y): y is number => y !== null)
     const bestFoot = footYs.length ? Math.max(...footYs) : 0
-    const footLag = Math.max(0, topHand - bestFoot - (this.ctx.footReach + 0.25))
+    // Pull a foot up only while it is far below the hands, not until it reaches them.
+    const footLag = Math.max(0, lowHand - 0.55 - bestFoot)
     const offHold = [c.LF, c.RF].filter((f) => f?.kind !== 'hold').length
     return (1.3 * (0.6 * near + 0.4 * far)) / (0.55 * handReach) + (2 - onFinish) * 0.8 + (1.8 * footLag) / handReach + offHold * 1.5
   }
@@ -187,13 +193,13 @@ export class Planner {
   }
 
   /**
-   * Highest a foot may be placed. The extra above the hip is what a drop knee
-   * needs; square poses still reject a foot the hip cannot sit beside.
+   * Highest a foot may be placed: clearly under the lower hand. A foot at
+   * hand height, or above it, is not a normal step.
    */
   footYMax(c: Contacts): number {
-    const topHand = Math.max(...[c.LH, c.RH].map((id) => (id ? lookup(this.ctx, id)!.y : 0)))
-    const extra = 0.08 + 0.24 * this.ctx.profile.flexibility
-    return Math.min(this.naturalHipY(c) + extra, topHand - 0.18)
+    const ys = [c.LH, c.RH].map((id) => (id ? lookup(this.ctx, id)!.y : null)).filter((y): y is number => y !== null)
+    const lowHand = ys.length ? Math.min(...ys) : 1
+    return lowHand - 0.2
   }
 
   /**
@@ -289,6 +295,9 @@ export class Planner {
     const otherFootId = otherFoot?.kind === 'hold' ? otherFoot.id : null
     const otherFootX = footX(otherFoot, ctx.byId)
     const crossesFoot = (x: number) => (otherFootX == null ? false : limb === 'LF' ? x > otherFootX + 0.05 : x < otherFootX - 0.05)
+    const bodyX = node.pose.x
+    // Left foot stays left of the body, right foot stays right, even when flagging.
+    const onOwnSide = (x: number) => (limb === 'LF' ? x <= bodyX + 0.06 : x >= bodyX - 0.06)
     const hip = hipPos(node.pose, ctx, side(limb))
     const maxHandY = Math.max(...[c.LH, c.RH].map((id) => (id ? lookup(ctx, id)!.y : 0)))
     // Prefer feet that close the gap under the hands when they lag behind.
@@ -299,23 +308,33 @@ export class Planner {
         return f.kind === 'smear' ? f.y : (lookup(ctx, f.id)?.y ?? 0)
       }),
     )
-    const needUp = maxHandY - bestFootNow > ctx.footReach + 0.25
+    const lowHand = Math.min(...[c.LH, c.RH].map((id) => (id ? lookup(ctx, id)!.y : maxHandY)))
+    const needUp = lowHand - 0.55 - bestFootNow > 0.2
     const yMax = this.footYMax(c)
     const hipLine = this.naturalHipY(c)
-    const idealY = needUp ? Math.min(yMax, hipLine - 0.05) : hipLine - 0.4 * ctx.dims.leg
+    const idealY =
+      this.strategy === 'feet-up'
+        ? Math.min(yMax - 0.02, lowHand - 0.28)
+        : needUp
+          ? Math.min(yMax - 0.05, lowHand - 0.5)
+          : Math.min(yMax - 0.08, hipLine - 0.45 * ctx.dims.leg)
     const reachable = ctx.footHolds
       .filter((h) => h.id !== curId && h.id !== otherFootId)
       .filter((h) => h.y >= 0.03 && h.y <= yMax)
       .filter((h) => Math.hypot(h.x - hip.x, h.y - hip.y) <= ctx.footReach + 0.8)
     const sameSide = reachable.filter((h) => !crossesFoot(h.x))
     const crossingFeet = reachable.filter((h) => crossesFoot(h.x))
-    const uncrossed = sameSide.length > 0 ? sameSide : reachable
-    const chips = uncrossed.filter(dedicatedFoot)
+    // A cross is the last resort: no foothold on this side, and no swap that frees one.
+    const swaps = this.footSwaps(node)
+    const lastResort = sameSide.length === 0 && swaps.length === 0
+    const pool = sameSide.length > 0 ? sameSide : lastResort ? crossingFeet.slice(0, 1) : []
+    const chips = pool.filter(dedicatedFoot)
     const open = chips.length
-      ? uncrossed.filter((h) => dedicatedFoot(h) || !chips.some((chip) => Math.hypot(chip.x - h.x, chip.y - h.y) < 0.4))
-      : uncrossed
+      ? pool.filter((h) => dedicatedFoot(h) || !chips.some((chip) => Math.hypot(chip.x - h.x, chip.y - h.y) < 0.4))
+      : pool
     const ranked = open.sort((a, b) => {
-      const score = (h: PlannerHold) => Math.abs(h.y - idealY) + 0.5 * Math.abs(h.x - hip.x) + (dedicatedFoot(h) ? -0.25 : 0)
+      const score = (h: PlannerHold) =>
+        Math.abs(h.y - idealY) + 0.5 * Math.abs(h.x - hip.x) + (onOwnSide(h.x) ? 0 : 0.6) + (dedicatedFoot(h) ? -0.25 : 0)
       return score(a) - score(b) || a.id.localeCompare(b.id)
     })
     const crossRanked = crossingFeet.sort((a, b) => Math.abs(a.y - idealY) - Math.abs(b.y - idealY) || a.id.localeCompare(b.id))
@@ -327,9 +346,10 @@ export class Planner {
       const primary = spots.find((p) => p.role === 'foot-edge') ?? spots[0]
       return spots.map((p) => ({ kind: 'hold' as const, id: h.id, patch: p.id === primary.id ? undefined : p.id }))
     }
-    const holds: FootContact[] = [...ranked.slice(0, 6), ...(sameSide.length > 0 ? crossRanked.slice(0, 2) : [])].flatMap(asFoot)
+    // One crossing option, and only when a swap cannot free the foot. price() makes it expensive.
+    const holds: FootContact[] = [...ranked.slice(0, 6), ...(swaps.length === 0 ? crossRanked.slice(0, 1) : [])].flatMap(asFoot)
     const smears = this.smearOptions(node.pose, limb as 'LF' | 'RF', c).filter(
-      (s): s is { kind: 'smear'; x: number; y: number } => !!s && s.kind === 'smear' && (sameSide.length === 0 || !crossesFoot(s.x)),
+      (s): s is { kind: 'smear'; x: number; y: number } => !!s && s.kind === 'smear' && (lastResort || !crossesFoot(s.x)),
     )
     const out = [...holds, ...smears]
     // Flag only when there is no hold and no wall smear (steep terrain). A smear beats sharing one hold.
@@ -424,6 +444,69 @@ export class Planner {
       const crosses = limb === 'LH' ? h.x > otherX + 0.05 : h.x < otherX - 0.05
       return crosses
     })
+  }
+
+  /**
+   * Uncross by swapping instead of crossing further. If the right foot is on
+   * the left foot's hold, it steps out to the right and the left foot takes
+   * that hold. The mirror case steps the left foot out to the left.
+   * Trading the two footholds is included when that alone puts each foot on
+   * its own side.
+   */
+  footSwaps(node: Node): Contacts[] {
+    const { ctx } = this
+    const lf = node.contacts.LF
+    const rf = node.contacts.RF
+    if (lf?.kind !== 'hold' || rf?.kind !== 'hold' || lf.id === rf.id) return []
+    const left = lookup(ctx, lf.id)
+    const right = lookup(ctx, rf.id)
+    if (!left || !right) return []
+    const out: Contacts[] = []
+    const seen = new Set<string>()
+    const add = (contacts: Contacts) => {
+      const key = contactsKey(contacts)
+      if (seen.has(key) || key === node.key) return
+      const lx = footX(contacts.LF, ctx.byId)
+      const rx = footX(contacts.RF, ctx.byId)
+      if (lx == null || rx == null || lx > rx - 0.02) return
+      seen.add(key)
+      out.push(contacts)
+    }
+    if (left.x > right.x + 0.02) add({ ...node.contacts, LF: rf, RF: lf })
+    const yMax = this.footYMax(node.contacts)
+    const body = node.pose.x
+    const outward = (side: 'L' | 'R', nearY: number) =>
+      ctx.footHolds
+        .filter((h) => h.id !== lf.id && h.id !== rf.id && h.y >= 0.03 && h.y <= yMax)
+        .filter((h) => (side === 'R' ? h.x >= Math.max(left.x, body) + 0.06 : h.x <= Math.min(right.x, body) - 0.06))
+        .sort((a, b) => Math.abs(a.y - nearY) - Math.abs(b.y - nearY) || a.id.localeCompare(b.id))
+        .slice(0, 2)
+    // Right foot sits on the left side of the body: step it out right, left foot inherits its hold.
+    if (right.x < body - 0.02) {
+      for (const h of outward('R', right.y)) add({ ...node.contacts, RF: { kind: 'hold', id: h.id }, LF: rf })
+    }
+    if (left.x > body + 0.02) {
+      for (const h of outward('L', left.y)) add({ ...node.contacts, LF: { kind: 'hold', id: h.id }, RF: lf })
+    }
+    return out
+  }
+
+  /** Extra cost so this search prefers one plan: square and low, turned out, or feet stepped up. */
+  private strategyBias(limb: Limb, stance: StanceId | undefined, footMove: boolean, footY: number, lowHand: number): number {
+    const s = stance ?? 'square'
+    if (this.strategy === 'outside') {
+      if (s.startsWith('hip-in') || s.startsWith('drop-knee')) return -1
+      if (s === 'square' && isHand(limb)) return 0.85
+      return 0
+    }
+    if (this.strategy === 'feet-up') {
+      if (!footMove) return 0
+      if (footY > lowHand - 0.5 && footY < lowHand - 0.2) return -1.8
+      if (footY <= lowHand - 0.7) return 0.8
+      return 0
+    }
+    if (s.startsWith('hip-in') || s.startsWith('drop-knee')) return 0.45
+    return 0
   }
 
   private hipFor(limb: Limb): StanceId {
@@ -542,12 +625,16 @@ export class Planner {
       if (hold.y < prevY - 0.1) cost += 0.8
       if (dynamic) cost += 2 + 1.5 * (1 - ctx.profile.power) + (ctx.profile.style === 'dynamic' ? -0.8 : 0)
       if (feetChanged > 0) cost += 2.8
-      cost += penalty.get(`${limb}:${hold.id}:${pr.pose.stance}`) ?? 0
+      cost += penalty.get(`${limb}:${hold.id}`) ?? 0
+      cost += this.strategyBias(limb, pr.pose.stance, false, 0, 0)
       if (prevHands.includes(hold.id) && kind !== 'match') cost += 0.5
       cost += tacticCost(pr.pose, pr.stretch, after, ctx, dynamic, hold)
     } else if (feetChanged === 2) {
       kind = 'foot'
-      cost = 0.7
+      const lx = footX(contacts.LF, ctx.byId)
+      const rx = footX(contacts.RF, ctx.byId)
+      const uncrossed = lx != null && rx != null && lx < rx - 0.02
+      cost = uncrossed ? 0.35 : 0.7
     } else {
       const f = contacts[limb as FootLimb]
       const otherFoot = contacts[limb === 'LF' ? 'RF' : 'LF']
@@ -560,7 +647,13 @@ export class Planner {
         cost += 2.6
       } else {
         const fy = lookup(ctx, f.id)!.y
-        kind = fy > pr.pose.y - 0.02 ? 'high-step' : 'foot'
+        const hands = [contacts.LH, contacts.RH].map((id) => (id ? lookup(ctx, id)?.y ?? 0 : 0))
+        const lowHand = Math.min(...hands)
+        kind = fy > lowHand - 0.22 ? 'high-step' : 'foot'
+        if (this.strategy !== 'feet-up' && fy > lowHand - 0.35) cost += 2.4
+        if (fy >= lowHand - 0.05) cost += 4
+        if (f.kind === 'hold') cost += penalty.get(`F:${f.id}`) ?? 0
+        cost += this.strategyBias(limb, pr.pose.stance, true, fy, lowHand)
         if (kind === 'high-step') cost += 0.9 * (1.2 - ctx.profile.flexibility)
         const h = lookup(ctx, f.id)!
         if (!dedicatedFoot(h) && ctx.footHolds.some((o) => o.id !== h.id && dedicatedFoot(o) && Math.hypot(o.x - h.x, o.y - h.y) < 0.4)) cost += 1.6
@@ -570,7 +663,8 @@ export class Planner {
       const lp = contactPoint(contacts, 'LF', ctx)
       const rp = contactPoint(contacts, 'RF', ctx)
       const twisting = pr.pose.stance.startsWith('hip-in') || pr.pose.stance.startsWith('drop-knee')
-      if (lp && rp && lp.x > rp.x + 0.05 && !twisting) cost += 1.8
+      // A cross is only for when no swap and no own-side foothold exist.
+      if (lp && rp && lp.x > rp.x + 0.05 && !twisting) cost += 9
     }
     const maxStretch = Math.max(0, ...Object.values(pr.stretch).map((s) => s ?? 0))
     if (maxStretch > 0.97) cost += (maxStretch - 0.97) / 0.03
@@ -601,6 +695,9 @@ export class Planner {
       if (other?.kind === 'hold' && other.id === target.id && (other.patch ?? '') === (target.patch ?? '')) return 'both feet on one hold'
     }
     if (!isHand(limb) && !feetLegal(contacts)) return 'at least one foot has to stay on a hold'
+    if (!isHand(limb) && feetCrossed(contacts, ctx.byId) && this.footSwaps(node).length > 0) {
+      return 'swap feet instead of crossing'
+    }
 
     const stances = this.stanceList(node, limb, contacts)
     let best: Node | null = null
@@ -690,8 +787,10 @@ export class Planner {
         .filter((h) => h.y < minHand - 0.12 && h.y >= 0.02)
         .filter((h) => Math.hypot(h.x - hip.x, h.y - hip.y) <= ctx.footReach + 0.85)
         .sort((a, b) => {
-          const score = (h: (typeof ctx.footHolds)[number]) =>
-            Math.abs(h.x - hip.x) + Math.abs(h.y - (pose0.y - 0.5 * ctx.dims.leg)) + (dedicatedFoot(h) ? -0.7 : 0)
+          const score = (h: (typeof ctx.footHolds)[number]) => {
+            const wrongSide = limb === 'LF' ? h.x > hip.x + 0.06 : h.x < hip.x - 0.06
+            return Math.abs(h.x - hip.x) + Math.abs(h.y - (pose0.y - 0.55 * ctx.dims.leg)) + (dedicatedFoot(h) ? -0.7 : 0) + (wrongSide ? 1.2 : 0)
+          }
           return score(a) - score(b) || a.id.localeCompare(b.id)
         })
         .slice(0, 7)
@@ -799,10 +898,9 @@ export class Planner {
         for (const limb of ['LH', 'RH', 'LF', 'RF'] as const) {
           for (const target of this.candidates(node, limb)) consider(this.tryMove(node, limb, target, penalty))
         }
-        const lf = node.contacts.LF
-        const rf = node.contacts.RF
-        if (lf?.kind === 'hold' && rf?.kind === 'hold' && (lf.id !== rf.id || (lf.patch ?? '') !== (rf.patch ?? ''))) {
-          consider(this.tryMove(node, 'LF', rf, penalty, { ...node.contacts, LF: rf, RF: lf }))
+        for (const swapped of this.footSwaps(node)) {
+          const next = swapped.LF
+          if (next) consider(this.tryMove(node, 'LF', next, penalty, swapped))
         }
       }
       const perHands = new Map<string, number>()
@@ -868,7 +966,21 @@ function toBeta(goal: Node, ctx: PlannerContext, id: string, label: string): Bet
       prev && limb && isHand(limb) && (['LF', 'RF'] as const).some((f) => footKey(n.contacts[f]) !== footKey(prev.contacts[f]))
     const swapped =
       prev && limb && !isHand(limb) && (['LF', 'RF'] as const).every((f) => footKey(n.contacts[f]) !== footKey(prev.contacts[f]) && n.contacts[f] && prev.contacts[f])
-    const detail = swapped ? ['Swap the feet in one move so the hips can face the next hold.', ...text.detail] : text.detail
+    let swapDetail: string | null = null
+    if (swapped && prev) {
+      const oldR = prev.contacts.RF
+      const newL = n.contacts.LF
+      const newR = n.contacts.RF
+      const oldL = prev.contacts.LF
+      const rightSteppedOut = oldR?.kind === 'hold' && newL?.kind === 'hold' && newL.id === oldR.id && newR?.kind === 'hold' && newR.id !== oldR.id
+      const leftSteppedOut = oldL?.kind === 'hold' && newR?.kind === 'hold' && newR.id === oldL.id && newL?.kind === 'hold' && newL.id !== oldL.id
+      swapDetail = rightSteppedOut
+        ? 'Step the right foot out to the right, and put the left foot on the hold it left.'
+        : leftSteppedOut
+          ? 'Step the left foot out to the left, and put the right foot on the hold it left.'
+          : 'Trade footholds so the left foot stays left and the right foot stays right.'
+    }
+    const detail = swapDetail ? [swapDetail, ...text.detail] : text.detail
     const title = swapped ? 'Swap the feet' : text.title
     const caveats = footFreed ? [...text.caveats, 'Smeared or flagged a foot to make the reach.'] : [...text.caveats]
     const drawn = skeletonFromPose(n.contacts, n.pose, ctx, { flag: n.statics.flag })
@@ -908,11 +1020,39 @@ function toBeta(goal: Node, ctx: PlannerContext, id: string, label: string): Bet
   return { id, label, steps, cost: goal.g, cruxStep, maxEffort, summary, verdict, caveats: [] }
 }
 
-const handSequence = (b: Beta) =>
-  b.steps
-    .filter((s) => s.limb && isHand(s.limb))
-    .map((s) => `${s.limb}:${holdIdOf(s.contacts[s.limb as 'LH' | 'RH'])}:${s.pose.stance}:${s.dynamic ? 'd' : 's'}`)
-    .join(',')
+const STRATEGIES: { id: BetaStrategy; title: string; blurb: string }[] = [
+  { id: 'straight', title: 'Straight', blurb: 'Square hips, feet kept low.' },
+  { id: 'outside', title: 'Outside', blurb: 'Turns the hip and swaps which hand leads.' },
+  { id: 'feet-up', title: 'Feet up', blurb: 'Steps the feet higher under the hands.' },
+]
+
+/** Same hands on the same holds, and the same footholds, means it is the same beta. */
+function samePlan(a: Beta, b: Beta): boolean {
+  const hands = (beta: Beta) =>
+    beta.steps
+      .filter((s) => s.limb && isHand(s.limb))
+      .map((s) => `${s.limb}:${holdIdOf(s.contacts[s.limb as 'LH' | 'RH'])}`)
+      .join(',')
+  const feet = (beta: Beta) =>
+    beta.steps
+      .flatMap((s) => [s.contacts.LF, s.contacts.RF])
+      .filter((f) => f?.kind === 'hold')
+      .map((f) => (f && f.kind === 'hold' ? f.id : ''))
+      .sort()
+      .join(',')
+  return hands(a) === hands(b) && feet(a) === feet(b)
+}
+
+function remember(penalty: Map<string, number>, beta: Beta, amount: number) {
+  for (const s of beta.steps) {
+    if (!s.limb) continue
+    if (!isHand(s.limb)) continue
+    const id = holdIdOf(s.contacts[s.limb])
+    if (!id) continue
+    const k = `${s.limb}:${id}`
+    penalty.set(k, (penalty.get(k) ?? 0) + amount)
+  }
+}
 
 export function planBeta(route: Route, profile: ClimberProfile, options: PlanOptions = {}): PlanResult {
   const t0 = Date.now()
@@ -949,19 +1089,27 @@ export function planBeta(route: Route, profile: ClimberProfile, options: PlanOpt
   const betas: Beta[] = []
   const penalty = new Map<string, number>()
   let lastBest: Node | null = null
-  for (let i = 0; i < opts.maxBetas && Date.now() < deadline; i++) {
-    const { goal, best } = planner.search(penalty, deadline)
-    lastBest ??= best
-    if (!goal) break
-    const beta = toBeta(goal, ctx, `beta-${i}`, `Beta ${String.fromCharCode(65 + betas.length)}`)
-    const seq = handSequence(beta)
-    if (!betas.some((b) => handSequence(b) === seq)) betas.push(beta)
-    for (const s of beta.steps) {
-      if (s.limb && isHand(s.limb)) {
-        const k = `${s.limb}:${holdIdOf(s.contacts[s.limb])}:${s.pose.stance}`
-        penalty.set(k, (penalty.get(k) ?? 0) + 4)
+  for (const strat of STRATEGIES.slice(0, opts.maxBetas)) {
+    if (Date.now() >= deadline) break
+    planner.strategy = strat.id
+    let found: Beta | null = null
+    for (let attempt = 0; attempt < 2 && Date.now() < deadline; attempt++) {
+      const { goal, best } = planner.search(penalty, deadline)
+      lastBest ??= best
+      if (!goal) break
+      const letter = String.fromCharCode(65 + betas.length)
+      const beta = toBeta(goal, ctx, `beta-${strat.id}`, `Beta ${letter} · ${strat.title}`)
+      beta.summary = `${strat.blurb} ${beta.summary}`
+      if (betas.some((b) => samePlan(b, beta))) {
+        remember(penalty, beta, 10)
+        continue
       }
+      found = beta
+      break
     }
+    if (!found) continue
+    betas.push(found)
+    remember(penalty, found, 8)
   }
 
   const stats = { expanded: planner.expanded, ms: Date.now() - t0 }

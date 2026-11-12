@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { matchesNamedColor, rgbToHex, rgbToHsv, rgbToLab, deltaE, type Rgb } from './color'
+import { matchesNamedColor, matchesSample, rgbToHex, rgbToHsv, rgbToLab, deltaE, type Rgb } from './color'
 import { detectHoldsFromImageData } from './detect'
 import { createImageData, detectFloorV, segmentHolds } from './segment'
 
@@ -72,6 +72,12 @@ describe('color helpers', () => {
     expect(matchesNamedColor({ r: 240, g: 120, b: 170 }, 'pink')).toBe(true)
   })
 
+  it('matches a shaded hold to an eyedropper sample of the same hue', () => {
+    const sample = { r: 236, g: 72, b: 153 }
+    expect(matchesSample(sample, { r: 140, g: 30, b: 90 })).toBe(true)
+    expect(matchesSample(sample, { r: 59, g: 130, b: 246 })).toBe(false)
+  })
+
   it('computes Lab ΔE for identical colors as ~0', () => {
     const a = rgbToLab({ r: 100, g: 120, b: 140 })
     expect(deltaE(a, a)).toBeCloseTo(0, 5)
@@ -111,7 +117,9 @@ describe('segment + detect', () => {
       expect(h.u).toBeLessThan(1)
       expect(h.v).toBeGreaterThan(0)
       expect(h.v).toBeLessThan(result.floorV ?? 1)
+      expect(h.outline == null || h.outline.length >= 3).toBe(true)
     }
+    expect(result.holds.some((h) => h.outline && h.outline.length >= 3)).toBe(true)
     expect(result.finishHoldIds.length).toBe(1)
   })
 
@@ -124,6 +132,39 @@ describe('segment + detect', () => {
     })
     const others = result.holds.filter((h) => !h.inRoute)
     expect(others.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('does not turn a tinted wall into a volume', () => {
+    const { data, W, H, pink } = makeWallPhoto()
+    // A panel-sized pink region, plus isolated holds that should survive.
+    fillRect(data, 8, 16, Math.floor(W * 0.62), Math.floor(H * 0.5), pink)
+    fillEllipse(data, W * 0.88, H * 0.3, 12, 10, pink)
+    fillEllipse(data, W * 0.86, H * 0.55, 11, 9, pink)
+    const result = detectHoldsFromImageData(data, { color: 'pink', sensitivity: 0.7 })
+    expect(result.holds.filter((h) => h.type === 'volume')).toHaveLength(0)
+    expect(result.holds.length).toBeGreaterThanOrEqual(2)
+    for (const h of result.holds) expect(h.radius).toBeLessThan(0.08)
+    expect(result.warnings.some((w) => w.includes('wall-sized'))).toBe(true)
+  })
+
+  it('keeps a half-shaded hold as one blob', () => {
+    const { data, W, H, pink, wall } = makeWallPhoto()
+    const cx = Math.floor(W * 0.5)
+    const cy = Math.floor(H * 0.4)
+    fillEllipse(data, cx, cy, 18, 14, pink)
+    // Shadow the lower half toward the wall color while staying pink.
+    for (let y = cy; y < cy + 16; y++) {
+      for (let x = cx - 18; x <= cx + 18; x++) {
+        const i = (y * W + x) * 4
+        if (data.data[i] !== pink.r) continue
+        data.data[i] = Math.round(pink.r * 0.45 + wall.r * 0.15)
+        data.data[i + 1] = Math.round(pink.g * 0.4)
+        data.data[i + 2] = Math.round(pink.b * 0.45)
+      }
+    }
+    const result = detectHoldsFromImageData(data, { color: 'pink', sensitivity: 0.6 })
+    const near = result.holds.filter((h) => Math.abs(h.u - 0.5) < 0.08 && Math.abs(h.v - 0.4) < 0.08)
+    expect(near.length).toBe(1)
   })
 
   it('segments with eyedropper target', () => {

@@ -6,6 +6,7 @@ import {
   holdRole,
   holdsByHeight,
   MAX_HOLD_RADIUS,
+  duplicateHold,
   moveHold,
   nextHoldLabel,
   removeHold,
@@ -39,6 +40,26 @@ describe('hold modifications', () => {
     removeHold(r, 'a')
     toggleStart(r, 'a')
     expect(JSON.stringify(r)).toBe(frozen)
+  })
+
+  it('moves an outline with the hold and can paste a copy', () => {
+    const outline = [
+      { u: 0.2, v: 0.2 },
+      { u: 0.3, v: 0.2 },
+      { u: 0.25, v: 0.35 },
+    ]
+    const r = routeWith(createHold({ id: 'a', u: 0.25, v: 0.25, outline, type: 'jug', radius: 0.05 }))
+    const moved = moveHold(r, 'a', { u: 0.45, v: 0.4 }).holds[0]!
+    expect(moved.outline?.[0]?.u).toBeCloseTo(0.4)
+    expect(moved.outline?.[0]?.v).toBeCloseTo(0.35)
+    const pasted = duplicateHold(r, 'a', { du: 0.1, dv: 0 })
+    expect(pasted.id).toBeTruthy()
+    const copy = pasted.route.holds.find((h) => h.id === pasted.id)!
+    expect(copy.outline?.[0]?.u).toBeCloseTo(0.3)
+    expect(copy.outline?.[0]?.v).toBeCloseTo(0.2)
+    expect(copy.type).toBe('jug')
+    expect(copy.radius).toBeCloseTo(0.05)
+    expect(pasted.route.startHoldIds).not.toContain(copy.id)
   })
 
   it('moves and clamps coordinates to the image', () => {

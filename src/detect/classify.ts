@@ -64,70 +64,83 @@ export function classifyComponent(comp: SegmentComponent, opts: ClassifyOptions)
   const horiz = elongated && (comp.orientation < 35 || comp.orientation > 145)
   const vert = elongated && comp.orientation >= 55 && comp.orientation <= 125
 
+  // Light bias points at the brighter lip. Image +y is down, so a highlight
+  // above the centroid (negative y) is a positive hold you pull down on.
+  const bias = Math.hypot(comp.lightBias.x, comp.lightBias.y)
+  const biasRadius = Math.max(2, Math.sqrt(comp.area / Math.PI))
+  let facingDeg: number | null = null
+  if (bias > biasRadius * 0.06) {
+    let deg = (Math.atan2(comp.lightBias.x, -comp.lightBias.y) * 180) / Math.PI
+    if (deg < 0) deg += 360
+    facingDeg = deg
+  }
+  const facingDown = facingDeg != null && facingDeg > 140 && facingDeg < 220
+  const facingSide = facingDeg != null && ((facingDeg > 50 && facingDeg < 130) || facingDeg > 230)
+
   let type: HoldType
   let allowHand = true
   let allowFoot = true
-  let facingDeg: number | null = null
   let confidence: number
 
-  // Volume: large, any color, always in play for hands+feet
-  if (areaFrac >= 0.02 || (diamM != null && diamM > 0.6)) {
+  const bboxWFrac = comp.bbox.w / segWidth
+  const bboxHFrac = comp.bbox.h / segHeight
+  const compact =
+    comp.solidity >= 0.62 &&
+    comp.elongation < 2.4 &&
+    bboxWFrac < 0.28 &&
+    bboxHFrac < 0.28
+  // Volume: a large compact blob, never a region that spans the wall.
+  if (compact && areaFrac >= 0.012 && areaFrac <= 0.04) {
     type = 'volume'
     allowHand = true
     allowFoot = true
+    facingDeg = facingSide ? facingDeg : null
     confidence = 0.45
   } else if ((diamM != null && diamM < 0.07) || (diamM == null && widthFrac < 0.015)) {
     type = 'foot-chip'
     allowHand = false
     allowFoot = true
     confidence = 0.4
+  } else if (facingDown && (horiz || comp.elongation < 2.2)) {
+    type = 'undercling'
+    confidence = 0.4
   } else if (horiz) {
-    if ((minorM != null && minorM < 0.035) || (minorM == null && minorFrac < 0.008)) {
-      type = 'crimp'
-      facingDeg = 0
-      confidence = 0.38
-    } else {
-      type = 'edge'
-      facingDeg = 0
-      confidence = 0.38
-    }
-  } else if (vert) {
-    // Pinch if somewhat thick; sidepull otherwise
-    if (comp.elongation >= 2.4 || widthFrac < 0.035) {
-      type = 'sidepull'
-      facingDeg = comp.orientation < 90 ? 90 : 270
-      confidence = 0.32
-    } else {
-      type = 'pinch'
-      facingDeg = null
-      confidence = 0.32
-    }
-  } else if (comp.solidity < 0.78) {
-    type = 'jug'
-    facingDeg = 0
+    const thin = (minorM != null && minorM < 0.035) || (minorM == null && minorFrac < 0.008)
+    type = thin ? 'crimp' : 'edge'
+    facingDeg = facingDeg ?? 0
+    confidence = 0.4
+  } else if (vert && (facingSide || comp.elongation >= 2.2)) {
+    type = 'sidepull'
+    if (facingDeg == null) facingDeg = comp.orientation < 90 ? 90 : 270
     confidence = 0.36
+  } else if (vert) {
+    type = 'pinch'
+    facingDeg = null
+    confidence = 0.32
+  } else if (comp.solidity < 0.78 || widthFrac > 0.028 || (diamM != null && diamM > 0.1)) {
+    type = 'jug'
+    facingDeg = facingDeg ?? 0
+    confidence = 0.38
   } else if (areaFrac >= 0.008 || (diamM != null && diamM > 0.18) || widthFrac > 0.06) {
     type = 'sloper'
     facingDeg = null
     confidence = 0.34
-  } else if (widthFrac > 0.028 || (diamM != null && diamM > 0.1)) {
-    type = 'jug'
-    facingDeg = 0
-    confidence = 0.33
   } else {
     type = 'edge'
-    facingDeg = 0
-    confidence = 0.3
+    facingDeg = facingDeg ?? 0
+    confidence = 0.32
   }
 
-  const radius = Math.max(0.004, Math.min(0.25, (diamPx / 2) / imageWidth))
+  const bboxRadius = Math.max(comp.bbox.w, comp.bbox.h) / 2 / segWidth
+  const radius = Math.max(0.004, Math.min(0.25, Math.max((diamPx / 2) / imageWidth, bboxRadius)))
 
   return {
     u: comp.centroid.u,
     v: comp.centroid.v,
     radius,
     type,
-    facingDeg,
+    facingDeg: facingDeg == null ? null : ((facingDeg % 360) + 360) % 360,
+    outline: comp.outline.length >= 3 ? comp.outline : null,
     inRoute: comp.isTarget,
     allowHand,
     allowFoot,
