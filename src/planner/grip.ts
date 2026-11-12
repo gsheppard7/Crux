@@ -1,5 +1,6 @@
-import type { HoldType } from '../model/schema'
+import type { ContactPatch, HoldType } from '../model/schema'
 import { fingerCapacity, technique, type ClimberProfile } from '../climber/profile'
+import { footPatch, primaryPatch } from './patches'
 import type { FootContact, PlannerHold } from './types'
 
 /**
@@ -89,15 +90,47 @@ export function directionFactor(hold: Pick<PlannerHold, 'type' | 'facingDeg'>, p
 /** Pressing down on a hold (hand below shoulder) is weaker than pulling but often available. */
 export const PRESS_EFFICIENCY = 0.85
 
+export interface Pull {
+  x: number
+  y: number
+  /** Shoulder minus contact, out of the wall. Positive pulls off the wall. */
+  z?: number
+}
+
+/**
+ * How well `pull` sits in the patch cone. 1 is straight against the outward
+ * normal. The cone widens the score; it is not a measured friction coefficient.
+ * Null facing stays omnidirectional in the wall plane, except slopers, which
+ * still lose capacity when the shoulder pulls off the wall.
+ */
+export function patchDirectionFactor(hold: Pick<PlannerHold, 'type' | 'facingDeg'>, patch: ContactPatch, pull: Pull | null): number {
+  if (!pull) return 1
+  const z = pull.z ?? 0
+  const len = Math.hypot(pull.x, pull.y, z)
+  if (len < 1e-6) return 1
+  if (hold.facingDeg === null && hold.type !== 'sloper') return 1
+  const align = -(patch.nx * pull.x + patch.ny * pull.y + patch.nz * z) / len
+  const floor = DIRECTION_FLOOR[hold.type]
+  const cone = Math.min(1, patch.coneDeg / 90)
+  const shaped = Math.pow(Math.max(0, (align + 1) / 2), 1.5 * (1.15 - 0.5 * cone))
+  return floor + (1 - floor) * shaped
+}
+
 /**
  * Best of pulling (arm in tension, toward the shoulder) and pressing (arm in
  * compression, away from the shoulder). `toShoulder` = shoulder − hand.
  */
-export function gripDirectionFactor(hold: Pick<PlannerHold, 'type' | 'facingDeg'>, toShoulder: { x: number; y: number } | null): number {
+export function gripDirectionFactor(
+  hold: Pick<PlannerHold, 'type' | 'facingDeg' | 'patches'>,
+  toShoulder: Pull | null,
+  patch?: ContactPatch,
+): number {
   if (!toShoulder) return 1
-  const pull = directionFactor(hold, toShoulder)
+  const spot = patch ?? ('patches' in hold && hold.patches ? primaryPatch({ patches: hold.patches }, 'hand') : undefined)
+  const score = (p: Pull) => (spot ? patchDirectionFactor(hold, spot, p) : directionFactor(hold, p))
+  const pull = score(toShoulder)
   if (toShoulder.y <= 0) return pull
-  return Math.max(pull, PRESS_EFFICIENCY * directionFactor(hold, { x: -toShoulder.x, y: -toShoulder.y }))
+  return Math.max(pull, PRESS_EFFICIENCY * score({ x: -toShoulder.x, y: -toShoulder.y, z: -(toShoulder.z ?? 0) }))
 }
 
 /** Slopers and volumes lose friction as the wall steepens; most holds lose a little. */
@@ -122,15 +155,16 @@ export function handCapacity(
   hold: PlannerHold,
   profile: ClimberProfile,
   angleDeg: number,
-  pull: { x: number; y: number } | null,
+  pull: Pull | null,
   armStretch: number | null,
+  patch?: ContactPatch,
 ): number {
   const diff = HAND_DIFFICULTY[(hold.difficulty ?? 3) - 1]
   return (
     fingerCapacity(profile) *
     HAND_TYPE[hold.type] *
     diff *
-    gripDirectionFactor(hold, pull) *
+    gripDirectionFactor(hold, pull, patch) *
     steepnessFactor(hold.type, angleDeg) *
     lockoffFactor(profile, angleDeg, armStretch)
   )
@@ -160,10 +194,18 @@ export function footEffectiveness(
   if (foot.kind === 'smear') return Math.min(1, smearEffectiveness(angleDeg) * tech)
   const h = byId.get(foot.id)
   if (!h) return 0
+  const spot = footPatch(h, foot.patch)
+  if (spot?.role === 'heel') {
+    // A heel pulls like a third arm on steep ground. Hamstring strength is a prior.
+    const heel = (angleDeg > 18 ? 0.62 : 0.28) * tech
+    return Math.max(0, Math.min(1, heel))
+  }
+  if (spot?.role === 'toe') return Math.max(0, Math.min(1, (angleDeg > 10 ? 0.45 : 0.2) * tech))
   const s = sinPos(angleDeg)
   const small = h.type === 'foot-chip' || h.type === 'crimp' || h.type === 'sloper' ? 1 - 0.2 * s : 1
   const steep = 1 - 0.45 * s * (1.2 - profile.core)
-  const e = FOOT_TYPE[h.type] * FOOT_DIFFICULTY[(h.difficulty ?? 3) - 1] * steep * small * tech
+  const smearSpot = spot?.role === 'smear' ? 0.85 : 1
+  const e = FOOT_TYPE[h.type] * FOOT_DIFFICULTY[(h.difficulty ?? 3) - 1] * steep * small * tech * smearSpot
   return Math.max(0, Math.min(1, e))
 }
 

@@ -74,6 +74,7 @@ export function createHold(fields: Partial<Hold> & Pick<Hold, 'u' | 'v'>): Hold 
     source: fields.source ?? 'manual',
     note: fields.note ?? '',
     color: fields.color ?? null,
+    patches: fields.patches ?? null,
   }
 }
 

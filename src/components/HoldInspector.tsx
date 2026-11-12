@@ -3,7 +3,8 @@ import { HOLD_TYPES } from '../model/schema'
 import { holdRole, removeHold, toggleFinish, toggleStart, updateHold } from '../model/route'
 import { radiusToImage, wallFrame } from '../model/coords'
 import { loadClimber } from '../climber/profile'
-import { DEFAULT_DEPTH_CM, holdGripSummary } from '../planner/grip'
+import { holdGripSummary } from '../planner/grip'
+import { toPlannerHold } from '../planner/context'
 import type { CommitOptions } from '../state/useRouteEditor'
 import { HOLD_TYPE_LABELS, ROLE_COLORS, ROLE_LABELS } from '../ui/theme'
 import { Button, Field, NumberInput, Section, Segmented, TextInput, Toggle, inputClass } from './form'
@@ -47,28 +48,7 @@ export function HoldInspector({ route, hold, apply, onSelect }: Props) {
   const wall = frame.toWall(hold)
   const diameterCm = radiusToImage(route.image, hold.radius) * 2 * frame.metersPerPixel * 100
   const climber = loadClimber()
-  const grip = hold.allowHand
-    ? holdGripSummary(
-        {
-          id: hold.id,
-          label: hold.label,
-          x: wall.x,
-          y: wall.y,
-          r: hold.radius * route.image.width * frame.metersPerPixel,
-          depth: (hold.depthCm ?? DEFAULT_DEPTH_CM[hold.type]) / 100,
-          type: hold.type,
-          facingDeg: hold.facingDeg,
-          difficulty: hold.difficulty,
-          hand: hold.allowHand,
-          foot: hold.allowFoot,
-          matchable: false,
-          confidence: hold.confidence,
-          source: hold.source,
-        },
-        climber,
-        route.wall.angleDeg,
-      )
-    : null
+  const grip = hold.allowHand ? holdGripSummary(toPlannerHold(hold, route), climber, route.wall.angleDeg) : null
 
   return (
     <Section

@@ -89,6 +89,7 @@ Rules for changing the schema:
 | `source` | `manual \| sample \| model` | `model` = auto-detect suggestions (low confidence; replaceable). |
 | `color` | `#rrggbb` or `null` | Dominant hold color from the photo / detector. |
 | `note` | string ≤ 500 | Defaults to `""`. |
+| `patches` | array or `null` | Optional contact spots (`hand`, `foot-edge`, `smear`, `heel`, `toe`) with a wall-frame offset, unit normal, cone angle, and width. `null` means the planner derives them from type, facing, radius, and depth. Normals and cones are estimates, not measured friction. |
 
 ## Semantic checks (`validateRoute`)
 

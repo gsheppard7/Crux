@@ -1,4 +1,4 @@
-import type { Hold, HoldType } from '../model/schema'
+import type { ContactPatch, Hold, HoldType } from '../model/schema'
 import type { BodyDims, ClimberProfile } from '../climber/profile'
 import type { WallFrame } from '../model/coords'
 
@@ -8,7 +8,20 @@ export type Limb = HandLimb | FootLimb
 export const LIMBS: Limb[] = ['LH', 'RH', 'LF', 'RF']
 
 /** A foot is on a hold, smearing the wall at a point, or free (flagging / dangling). */
-export type FootContact = { kind: 'hold'; id: string } | { kind: 'smear'; x: number; y: number } | null
+export type FootContact =
+  | { kind: 'hold'; id: string; /** Secondary contact spot. Omit for the primary patch. */ patch?: string }
+  | { kind: 'smear'; x: number; y: number }
+  | null
+
+/** Hips square, one hip turned in, a drop knee, or an outside flag. */
+export type StanceId =
+  | 'square'
+  | 'hip-in-L'
+  | 'hip-in-R'
+  | 'drop-knee-L'
+  | 'drop-knee-R'
+  | 'flag-outside-L'
+  | 'flag-outside-R'
 
 export interface Contacts {
   LH: string | null
@@ -17,11 +30,15 @@ export interface Contacts {
   RF: FootContact
 }
 
-/** Pelvis position in wall-local meters plus torso lean (radians, + = shoulders to the right). */
+/**
+ * Pelvis position in wall-local meters, torso lean (radians, + = shoulders to the right),
+ * and a discrete hip stance. Yaw lives in the stance, not as a free variable.
+ */
 export interface Pose {
   x: number
   y: number
   lean: number
+  stance: StanceId
 }
 
 export interface PlannerHold {
@@ -40,6 +57,8 @@ export interface PlannerHold {
   matchable: boolean
   confidence: number
   source: Hold['source']
+  /** Derived when the route hold has no patches of its own. */
+  patches: ContactPatch[]
 }
 
 export interface PlannerContext {
@@ -77,9 +96,14 @@ export interface Statics {
   barnDoor: number
   flag: FootLimb | null
   feet: { limb: FootLimb; effectiveness: number }[]
+  /**
+   * False when the center of mass is outside the contacts and no loaded
+   * patch can push back against that swing. Cone angles are priors.
+   */
+  opposed: boolean
 }
 
-export type MoveKind = 'start' | 'reach' | 'match' | 'cross' | 'dyno' | 'foot' | 'high-step' | 'smear' | 'flag' | 'cut'
+export type MoveKind = 'start' | 'reach' | 'match' | 'cross' | 'dyno' | 'mantle' | 'foot' | 'high-step' | 'smear' | 'flag' | 'cut'
 
 export interface BetaStep {
   index: number

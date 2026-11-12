@@ -1,13 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import { addHold, createEmptyRoute, createHold, setWall, toggleFinish, toggleStart } from '../model/route'
 import type { Hold, Route } from '../model/schema'
-import { bodyDims, DEFAULT_CLIMBER, inchesToM, type ClimberProfile } from '../climber/profile'
+import { bodyDims, DEFAULT_CLIMBER, dynamicGain, inchesToM, type ClimberProfile } from '../climber/profile'
 import { sampleRoutes } from '../samples/sampleRoutes'
+import { skeletonFromPose } from '../avatar/skeleton'
 import { buildContext } from './context'
-import { evaluateStatics, solvePose } from './body'
-import { directionFactor, holdGripSummary } from './grip'
-import { Planner, planBeta } from './search'
-import type { Contacts } from './types'
+import { evaluateStatics, solvePose, stanceGate } from './body'
+import { directionFactor, handCapacity, holdGripSummary } from './grip'
+import { PRE_CHANGE_BASELINE } from './baseline.snapshot'
+import { Planner, isMantle, planBeta, tacticCost } from './search'
+import type { Contacts, Statics } from './types'
 
 const W = 1000
 const H = 1500
@@ -273,4 +275,263 @@ describe('beta planner', () => {
     },
     30000,
   )
+})
+
+/** Realistic terrain used to compare planner changes. Timings are machine-local. */
+export const realismFixtures: { name: string; route: Route; expectOk: boolean }[] = [
+  { name: 'vertical', route: ladder(0), expectOk: true },
+  { name: 'slab', route: ladder(-12), expectOk: true },
+  { name: 'overhang-30', route: ladder(30), expectOk: true },
+  {
+    name: 'sidepull-cluster',
+    route: routeFromMeters(
+      [
+        { id: 's1', x: 1.15, y: 1.45, type: 'sidepull', facingDeg: 90, radius: 0.02 },
+        { id: 's2', x: 1.35, y: 1.55, type: 'sidepull', facingDeg: 90, radius: 0.02 },
+        { id: 'a', x: 1.2, y: 2.15, type: 'sidepull', facingDeg: 90, radius: 0.02 },
+        { id: 'fin', x: 1.45, y: 2.85, type: 'jug', radius: 0.035 },
+        { id: 'f1', x: 1.1, y: 0.55, type: 'edge', facingDeg: 90, radius: 0.012, allowHand: false },
+        { id: 'f2', x: 1.28, y: 0.9, type: 'edge', facingDeg: 90, radius: 0.012, allowHand: false },
+      ],
+      { angle: 25, start: ['s1', 's2'], finish: ['fin'] },
+    ),
+    expectOk: true,
+  },
+  {
+    name: 'sloper-high',
+    route: routeFromMeters(
+      [
+        { id: 's1', x: 1.35, y: 1.4, type: 'jug' },
+        { id: 's2', x: 1.7, y: 1.4, type: 'jug' },
+        { id: 'sl', x: 1.5, y: 2.35, type: 'sloper', facingDeg: 0, radius: 0.04, difficulty: 3 },
+        { id: 'fin', x: 1.5, y: 3.15, type: 'jug', radius: 0.035 },
+        { id: 'f1', x: 1.4, y: 0.5, type: 'edge', allowHand: false, radius: 0.015 },
+        { id: 'f2', x: 1.65, y: 0.7, type: 'edge', allowHand: false, radius: 0.015 },
+      ],
+      { angle: 15, start: ['s1', 's2'], finish: ['fin'] },
+    ),
+    expectOk: false,
+  },
+  {
+    name: 'volume',
+    route: routeFromMeters(
+      [
+        { id: 's1', x: 1.3, y: 1.4, type: 'jug' },
+        { id: 's2', x: 1.75, y: 1.45, type: 'jug' },
+        { id: 'vol', x: 1.5, y: 2.2, type: 'volume', facingDeg: 270, radius: 0.06, depthCm: 28 },
+        { id: 'fin', x: 1.55, y: 3.2, type: 'jug', radius: 0.035 },
+        { id: 'f1', x: 1.35, y: 0.45, type: 'foot-chip', radius: 0.012, allowHand: false },
+        { id: 'f2', x: 1.7, y: 0.6, type: 'foot-chip', radius: 0.012, allowHand: false },
+      ],
+      { angle: 20, start: ['s1', 's2'], finish: ['fin'] },
+    ),
+    expectOk: false,
+  },
+]
+
+describe('realism fixtures', () => {
+  it('plans each terrain inside the interactive budget', () => {
+    expect(PRE_CHANGE_BASELINE.map((row) => row.name)).toEqual(realismFixtures.map((f) => f.name))
+    for (const f of realismFixtures) {
+      const res = planBeta(f.route, DEFAULT_CLIMBER, { maxBetas: 1, timeBudgetMs: 8000 })
+      expect(res.stats.ms, f.name).toBeLessThan(8000)
+      if (f.expectOk) expect(res.ok, f.name).toBe(true)
+    }
+  })
+
+  it('keeps a vertical jug ladder mostly square', () => {
+    const res = planBeta(ladder(0), DEFAULT_CLIMBER, { maxBetas: 1 })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const steps = res.betas[0].steps
+    const square = steps.filter((s) => s.pose.stance === 'square').length
+    expect(square).toBeGreaterThanOrEqual(steps.length / 2)
+    expect(res.betas[0].summary).toMatch(/hips square|hip in|drop knee|flag/)
+    const ctx = buildContext(ladder(0), DEFAULT_CLIMBER)
+    for (const step of steps) {
+      const drawn = skeletonFromPose(step.contacts, step.pose, ctx, { flag: step.statics.flag })
+      const worse = drawn.overstretched.filter((l) => (step.stretch[l] ?? 0) <= 1.02)
+      if (worse.length > 0) expect(step.caveats.join(' ')).toMatch(/drawn pose/)
+      else expect(step.caveats.join(' ')).not.toMatch(/drawn pose/)
+    }
+  })
+})
+
+describe('hold patches', () => {
+  it('gives a foot chip no heel and a volume several contacts', () => {
+    const chip = buildContext(ladder(0), DEFAULT_CLIMBER).byId.get('f1')!
+    expect(chip.patches.some((p) => p.role === 'heel' || p.role === 'hand')).toBe(false)
+    expect(chip.patches.every((p) => p.role === 'foot-edge')).toBe(true)
+    const vol = buildContext(realismFixtures.find((f) => f.name === 'volume')!.route, DEFAULT_CLIMBER).byId.get('vol')!
+    expect(vol.patches.filter((p) => p.role === 'hand').length).toBeGreaterThan(1)
+    expect(vol.patches.some((p) => p.role === 'heel')).toBe(true)
+    expect(vol.patches.some((p) => p.role === 'smear')).toBe(true)
+  })
+
+  it('raises utilization when the pull goes off a sloper', () => {
+    const route = realismFixtures.find((f) => f.name === 'sloper-high')!.route
+    const sl = buildContext(route, DEFAULT_CLIMBER).byId.get('sl')!
+    const off = handCapacity(sl, DEFAULT_CLIMBER, 15, { x: 0, y: -0.1, z: 0.35 }, 0.9)
+    const intoWall = handCapacity(sl, DEFAULT_CLIMBER, 15, { x: 0, y: -0.45, z: -0.12 }, 0.9)
+    expect(off).toBeLessThan(intoWall)
+    const load = 0.4
+    expect(load / off).toBeGreaterThan(load / intoWall)
+  })
+
+  it('rejects an unopposed sidepull and accepts one with an opposing foot', () => {
+    const route = routeFromMeters(
+      [
+        { id: 'sp', x: 1.2, y: 1.6, type: 'sidepull', facingDeg: 90, radius: 0.02 },
+        { id: 'f', x: 1.15, y: 0.8, type: 'edge', facingDeg: 90, radius: 0.015, allowHand: false },
+        { id: 'opp', x: 1.15, y: 0.9, type: 'edge', facingDeg: 270, radius: 0.015, allowHand: false },
+      ],
+      { start: ['sp'], finish: ['sp'] },
+    )
+    const ctx = buildContext(route, DEFAULT_CLIMBER)
+    const pose = { x: 1.85, y: 1.15, lean: 0, stance: 'square' as const }
+    const bare: Contacts = { LH: 'sp', RH: null, LF: { kind: 'hold', id: 'f' }, RF: null }
+    const bad = evaluateStatics(bare, pose, ctx)
+    expect(bad.barnDoor).toBeGreaterThan(0.08)
+    expect(bad.opposed).toBe(false)
+    const helped = evaluateStatics({ ...bare, LF: { kind: 'hold', id: 'opp' } }, pose, ctx)
+    expect(helped.opposed).toBe(true)
+  })
+})
+
+describe('stances', () => {
+  it('drop knee reaches past square hips and is not labeled a dyno', () => {
+    const make = (y: number) =>
+      routeFromMeters(
+        [
+          { id: 's1', x: 1.25, y: 1.65, type: 'jug' },
+          { id: 's2', x: 1.6, y: 1.65, type: 'jug' },
+          { id: 'up', x: 1.9, y, type: 'jug', radius: 0.04 },
+          { id: 'hi', x: 1.05, y: 1.5, type: 'edge', radius: 0.016, allowHand: false },
+          { id: 'lo', x: 1.7, y: 0.85, type: 'edge', radius: 0.016, allowHand: false },
+        ],
+        { start: ['s1', 's2'], finish: ['up'] },
+      )
+    const opts = { beamWidth: 8, perHandPair: 2, maxDepth: 8, maxBetas: 1, timeBudgetMs: 2000 }
+    let movedStance = ''
+    const notes: string[] = []
+    for (let y = 2.7; y <= 3.3; y += 0.05) {
+      const candidate = make(Number(y.toFixed(2)))
+      const c = buildContext(candidate, DEFAULT_CLIMBER)
+      const contacts: Contacts = { LH: 's1', RH: 'up', LF: { kind: 'hold', id: 'hi' }, RF: { kind: 'hold', id: 'lo' } }
+      const sq = solvePose(contacts, c, 'square').feasible
+      const hip = solvePose(contacts, c, 'hip-in-L').feasible
+      const dk = solvePose(contacts, c, 'drop-knee-L').feasible
+      const planner = new Planner(c, opts)
+      const start = planner.startNodes().nodes.find((n) => n.contacts.LF?.kind === 'hold' && n.contacts.LF.id === 'hi')
+      const moved = start ? planner.tryMove(start, 'RH', 'up', new Map()) : 'no start'
+      const stance = typeof moved === 'string' ? moved : `${moved.pose.stance}${moved.move?.dynamic ? ' dyn' : ''}`
+      notes.push(`${y.toFixed(2)} sq=${sq} hip=${hip} dk=${dk} move=${stance}`)
+      if (!sq && !hip && dk && typeof moved !== 'string' && moved.pose.stance === 'drop-knee-L' && !moved.move?.dynamic) {
+        movedStance = stance
+        break
+      }
+    }
+    expect(movedStance, notes.join('\n')).toBe('drop-knee-L')
+    const gateRoute = make(2.9)
+    const gateCtx = buildContext(gateRoute, DEFAULT_CLIMBER)
+    const planted: Contacts = { LH: 's1', RH: 'up', LF: { kind: 'hold', id: 'hi' }, RF: { kind: 'hold', id: 'lo' } }
+    const stiff = solvePose(planted, buildContext(gateRoute, { ...DEFAULT_CLIMBER, flexibility: 0 }), 'drop-knee-L')
+    expect(stiff.feasible).toBe(false)
+    expect(stiff.violations.join(' ')).toMatch(/flexibility/)
+    expect(stanceGate({ ...planted, LF: { kind: 'smear', x: 1.05, y: 1.4 } }, 'drop-knee-L', gateCtx).ok).toBe(false)
+  })
+
+  it('flags the outside leg on the swing side harder than the old constant', () => {
+    const route = routeFromMeters(
+      [
+        { id: 'a', x: 1.2, y: 1.6, type: 'jug' },
+        { id: 'b', x: 1.35, y: 1.65, type: 'jug' },
+        { id: 'f', x: 1.25, y: 0.8, type: 'edge', allowHand: false, radius: 0.015 },
+      ],
+      { start: ['a', 'b'], finish: ['b'] },
+    )
+    const ctx = buildContext(route, DEFAULT_CLIMBER)
+    const contacts: Contacts = { LH: 'a', RH: 'b', LF: { kind: 'hold', id: 'f' }, RF: null }
+    const pose = { x: 1.75, y: 1.1, lean: 0, stance: 'square' as const }
+    const square = evaluateStatics(contacts, pose, ctx)
+    const correct = evaluateStatics(contacts, { ...pose, stance: 'flag-outside-R' }, ctx)
+    const wrong = evaluateStatics(
+      { LH: 'a', RH: 'b', LF: null, RF: { kind: 'hold', id: 'f' } },
+      { ...pose, stance: 'flag-outside-L' },
+      ctx,
+    )
+    const oldReduction = 0.12 + 0.1 * DEFAULT_CLIMBER.flexibility
+    expect(square.barnDoor - correct.barnDoor).toBeGreaterThan(oldReduction)
+    expect(correct.barnDoor).toBeLessThan(wrong.barnDoor)
+  })
+
+  it('prefers a straight hip-in on an overhang to a bent square stance', () => {
+    const ctx = buildContext(ladder(30), DEFAULT_CLIMBER)
+    const hold = ctx.byId.get('a')!
+    const statics = {
+      uMax: 0.4,
+      hands: [],
+      handShare: 0.6,
+      barnDoor: 0,
+      flag: null,
+      opposed: true,
+      feet: [
+        { limb: 'LF' as const, effectiveness: 0.8 },
+        { limb: 'RF' as const, effectiveness: 0.8 },
+      ],
+    } satisfies Statics
+    const square = tacticCost({ x: 1.5, y: 1.2, lean: 0, stance: 'square' }, { LH: 0.5, RH: 0.55 }, statics, ctx, false, hold)
+    const hip = tacticCost({ x: 1.5, y: 1.2, lean: 0, stance: 'hip-in-L' }, { LH: 0.88, RH: 0.9 }, statics, ctx, false, hold)
+    expect(hip).toBeLessThan(square)
+  })
+})
+
+describe('deadpoints', () => {
+  it('dynos a gap past a static reach, and a static climber cannot', () => {
+    expect(dynamicGain({ ...DEFAULT_CLIMBER, style: 'static' })).toBe(0)
+    const jumping = { ...DEFAULT_CLIMBER, style: 'dynamic' as const, power: 1 }
+    const planted = { ...DEFAULT_CLIMBER, style: 'static' as const, power: 0 }
+    const opts = { beamWidth: 6, perHandPair: 2, maxDepth: 6, maxBetas: 1, timeBudgetMs: 2000 }
+    const make = (y: number) =>
+      routeFromMeters(
+        [
+          { id: 's1', x: 1.15, y: 1.6, type: 'jug', radius: 0.04 },
+          { id: 's2', x: 1.5, y: 1.6, type: 'jug', radius: 0.04 },
+          { id: 'up', x: y, y: 1.85, type: 'jug', radius: 0.045 },
+          { id: 'f1', x: 1.2, y: 0.7, type: 'edge', allowHand: false, radius: 0.016 },
+          { id: 'f2', x: 1.55, y: 0.85, type: 'edge', allowHand: false, radius: 0.016 },
+        ],
+        { start: ['s1', 's2'], finish: ['up'] },
+      )
+    const reach = (profile: ClimberProfile, y: number) => {
+      const ctx = buildContext(make(y), profile)
+      const planner = new Planner(ctx, opts)
+      const start = planner.startNodes().nodes[0]
+      if (!start) return 'no start'
+      const moved = planner.tryMove(start, 'RH', 'up', new Map())
+      return typeof moved === 'string' ? moved : moved
+    }
+    let found = false
+    const notes: string[] = []
+    for (let y = 2.75; y <= 2.95; y += 0.01) {
+      const dyn = reach(jumping, Number(y.toFixed(2)))
+      const stat = reach(planted, Number(y.toFixed(2)))
+      const dynText = typeof dyn === 'string' ? dyn : dyn.move?.dynamic ? 'dyno' : dyn.pose.stance
+      const statText = typeof stat === 'string' ? stat : stat.pose.stance
+      notes.push(`${y.toFixed(2)} dyn=${dynText} stat=${statText}`)
+      if (typeof dyn !== 'string' && dyn.move?.dynamic && typeof stat === 'string') {
+        found = true
+        expect(stat).toMatch(/reach|range|deadpoint|catch|hold/)
+        break
+      }
+    }
+    expect(found, notes.join('\n')).toBe(true)
+  })
+
+  it('treats a press on a wide upward jug as a mantle', () => {
+    const jug = buildContext(ladder(0), DEFAULT_CLIMBER).byId.get('fin')!
+    expect(isMantle(jug, 0.25)).toBe(true)
+    const sloper = buildContext(realismFixtures.find((f) => f.name === 'sloper-high')!.route, DEFAULT_CLIMBER).byId.get('sl')!
+    expect(isMantle(sloper, 0.25)).toBe(false)
+  })
 })

@@ -29,6 +29,28 @@ export const HOLD_SOURCES = ['manual', 'sample', 'model'] as const
 export const FOOT_RULES = ['open', 'route-only'] as const
 export const SCALE_SOURCES = ['default', 'wall-width', 'reference-hold', 'floor-height'] as const
 
+/**
+ * What a limb can do on one spot of a hold. Cones are planning priors, not
+ * measured friction.
+ */
+export const PATCH_ROLES = ['hand', 'foot-edge', 'smear', 'heel', 'toe'] as const
+
+export const ContactPatchSchema = z.object({
+  id: z.string().min(1),
+  role: z.enum(PATCH_ROLES),
+  /** Meters from the hold center, wall frame. */
+  dx: z.number().finite(),
+  dy: z.number().finite(),
+  dz: z.number().finite(),
+  /** Unit normal. +z points out of the wall, toward the climber. */
+  nx: z.number().finite(),
+  ny: z.number().finite(),
+  nz: z.number().finite(),
+  /** Half-angle of the usable force cone, in degrees. An estimate. */
+  coneDeg: z.number().finite().min(0).max(180),
+  widthM: z.number().finite().min(0).max(2),
+})
+
 const unit = z.number().finite().min(0).max(1)
 
 export const HoldSchema = z.object({
@@ -66,6 +88,11 @@ export const HoldSchema = z.object({
     .regex(/^#[0-9a-f]{6}$/i)
     .nullable()
     .default(null),
+  /**
+   * Optional contact spots. Null means the planner derives them from type,
+   * facing, radius, and depth. Cones and normals are estimates.
+   */
+  patches: z.array(ContactPatchSchema).nullable().default(null),
 })
 
 export const RouteImageSchema = z.object({
@@ -111,6 +138,8 @@ export const RouteSchema = z.object({
 
 export type Hold = z.infer<typeof HoldSchema>
 export type HoldType = (typeof HOLD_TYPES)[number]
+export type PatchRole = (typeof PATCH_ROLES)[number]
+export type ContactPatch = z.infer<typeof ContactPatchSchema>
 export type RouteImage = z.infer<typeof RouteImageSchema>
 export type Wall = z.infer<typeof WallSchema>
 export type FootRule = (typeof FOOT_RULES)[number]

@@ -1,5 +1,6 @@
 import { bodyDims, type BodyDims, type ClimberProfile } from '../climber/profile'
-import { hipPos, shoulderCenter, shoulderPos, side } from '../planner/body'
+import { flagLimb, flagPoint, hipGap, hipPos, shoulderCenter, shoulderGap, shoulderPos, side } from '../planner/body'
+import { footPatch, handPatch, holdIdOf } from '../planner/patches'
 import type { Beta, BetaStep, Contacts, Limb, PlannerContext, Pose } from '../planner/types'
 
 export type Vec3 = { x: number; y: number; z: number }
@@ -96,11 +97,12 @@ export function twoBoneIk(
 }
 
 function handTarget(ctx: PlannerContext, contacts: Contacts, limb: 'LH' | 'RH'): Vec3 | null {
-  const id = contacts[limb]
+  const id = holdIdOf(contacts[limb])
   if (!id) return null
   const h = ctx.byId.get(id)
   if (!h) return null
-  return { x: h.x, y: h.y, z: h.depth * 0.7 + 0.02 }
+  const spot = handPatch(h, contacts[limb])
+  return { x: h.x + (spot?.dx ?? 0), y: h.y + (spot?.dy ?? 0), z: (h.depth + (spot?.dz ?? 0)) * 0.7 + 0.02 }
 }
 
 function footTarget(ctx: PlannerContext, contacts: Contacts, limb: 'LF' | 'RF', _pose: Pose): Vec3 | null {
@@ -109,14 +111,13 @@ function footTarget(ctx: PlannerContext, contacts: Contacts, limb: 'LF' | 'RF', 
   if (f.kind === 'smear') return { x: f.x, y: f.y, z: 0.04 }
   const h = ctx.byId.get(f.id)
   if (!h) return null
-  return { x: h.x, y: h.y, z: h.depth * 0.6 + 0.03 }
+  const spot = footPatch(h, f.patch)
+  return { x: h.x + (spot?.dx ?? 0), y: h.y + (spot?.dy ?? 0), z: (h.depth + (spot?.dz ?? 0)) * 0.6 + 0.03 }
 }
 
 function flagFoot(ctx: PlannerContext, pose: Pose, limb: 'LF' | 'RF'): Vec3 {
-  const s = side(limb)
-  const L = ctx.dims.leg
-  const hip = hipPos(pose, ctx, s)
-  return { x: hip.x + s * 0.45 * L, y: hip.y - 0.55 * L, z: 0.25 }
+  const p = flagPoint(pose, ctx, limb)
+  return { x: p.x, y: p.y, z: 0.06 }
 }
 
 function danglingFoot(ctx: PlannerContext, pose: Pose, limb: 'LF' | 'RF'): Vec3 {
@@ -131,20 +132,22 @@ function danglingFoot(ctx: PlannerContext, pose: Pose, limb: 'LF' | 'RF'): Vec3 
 export function skeletonFromPose(contacts: Contacts, pose: Pose, ctx: PlannerContext, opts?: { flag?: Limb | null }): Skeleton {
   const dims = ctx.dims
   const lean = pose.lean
-  const pelvis: Vec3 = { x: pose.x, y: pose.y, z: 0.22 }
+  const close = shoulderGap(pose.stance) / 0.15
+  const hipClose = hipGap(pose.stance) / 0.18
+  const pelvis: Vec3 = { x: pose.x, y: pose.y, z: 0.22 * hipClose }
   const sc = shoulderCenter(pose, ctx)
-  const chest: Vec3 = { x: sc.x, y: sc.y - 0.15 * dims.torso, z: 0.28 }
-  const neck: Vec3 = { x: sc.x, y: sc.y + 0.05 * dims.torso, z: 0.32 }
-  const head: Vec3 = { x: sc.x + 0.15 * dims.neck * Math.sin(lean), y: sc.y + dims.neck, z: 0.38 }
+  const chest: Vec3 = { x: sc.x, y: sc.y - 0.15 * dims.torso, z: 0.28 * close }
+  const neck: Vec3 = { x: sc.x, y: sc.y + 0.05 * dims.torso, z: 0.32 * close }
+  const head: Vec3 = { x: sc.x + 0.15 * dims.neck * Math.sin(lean), y: sc.y + dims.neck, z: 0.38 * close }
 
   const Ls = shoulderPos(pose, ctx, -1)
   const Rs = shoulderPos(pose, ctx, 1)
-  const L_shoulder: Vec3 = { x: Ls.x, y: Ls.y, z: 0.3 }
-  const R_shoulder: Vec3 = { x: Rs.x, y: Rs.y, z: 0.3 }
+  const L_shoulder: Vec3 = { x: Ls.x, y: Ls.y, z: 0.3 * close }
+  const R_shoulder: Vec3 = { x: Rs.x, y: Rs.y, z: 0.3 * close }
   const Lh = hipPos(pose, ctx, -1)
   const Rh = hipPos(pose, ctx, 1)
-  const L_hip: Vec3 = { x: Lh.x, y: Lh.y, z: 0.2 }
-  const R_hip: Vec3 = { x: Rh.x, y: Rh.y, z: 0.2 }
+  const L_hip: Vec3 = { x: Lh.x, y: Lh.y, z: 0.2 * hipClose }
+  const R_hip: Vec3 = { x: Rh.x, y: Rh.y, z: 0.2 * hipClose }
 
   const overstretched: Limb[] = []
   const flag = opts?.flag ?? null
@@ -158,12 +161,16 @@ export function skeletonFromPose(contacts: Contacts, pose: Pose, ctx: PlannerCon
   }
   const solveLeg = (limb: 'LF' | 'RF', root: Vec3) => {
     let target: Vec3
+    const flagged = flagLimb(pose.stance)
     if (!contacts[limb]) {
-      target = flag === limb || (flag === null && !contacts[limb === 'LF' ? 'RF' : 'LF']) ? flagFoot(ctx, pose, limb) : danglingFoot(ctx, pose, limb)
+      target = flagged === limb || flag === limb || (flag === null && flagged === null && !contacts[limb === 'LF' ? 'RF' : 'LF'])
+        ? flagFoot(ctx, pose, limb)
+        : danglingFoot(ctx, pose, limb)
     } else {
       target = footTarget(ctx, contacts, limb, pose) ?? danglingFoot(ctx, pose, limb)
     }
-    const pole = add(root, { x: side(limb) * 0.9, y: 0.1, z: 0.8 })
+    const dropKnee = (pose.stance === 'drop-knee-L' && limb === 'LF') || (pose.stance === 'drop-knee-R' && limb === 'RF')
+    const pole = dropKnee ? add(root, { x: side(limb) * 0.15, y: -1, z: 0.15 }) : add(root, { x: side(limb) * 0.9, y: 0.1, z: 0.8 })
     const ik = twoBoneIk(root, target, dims.thigh, dims.shank, pole)
     if (ik.stretch > 1.005) overstretched.push(limb)
     return ik
@@ -196,7 +203,12 @@ export function skeletonFromPose(contacts: Contacts, pose: Pose, ctx: PlannerCon
 }
 
 function lerpPose(a: Pose, b: Pose, t: number): Pose {
-  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, lean: a.lean + (b.lean - a.lean) * t }
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    lean: a.lean + (b.lean - a.lean) * t,
+    stance: t < 0.5 ? (a.stance ?? 'square') : (b.stance ?? 'square'),
+  }
 }
 
 function lerpContacts(a: Contacts, b: Contacts, limb: Limb | null, t: number): Contacts {

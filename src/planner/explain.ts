@@ -1,5 +1,5 @@
 import { HOLD_TYPE_LABELS } from '../ui/theme'
-import type { Contacts, FootContact, Limb, MoveKind, PlannerContext, PlannerHold, Statics } from './types'
+import type { Contacts, FootContact, Limb, MoveKind, PlannerContext, PlannerHold, Pose, StanceId, Statics } from './types'
 
 export const LIMB_NAMES: Record<Limb, string> = { LH: 'left hand', RH: 'right hand', LF: 'left foot', RF: 'right foot' }
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
@@ -54,6 +54,46 @@ const TYPE_HINT: Partial<Record<PlannerHold['type'], string>> = {
   volume: 'Use the volume’s edge or friction; it is always in play.',
 }
 
+export function stanceLabel(stance: StanceId | undefined): string {
+  switch (stance) {
+    case 'hip-in-L':
+      return 'left hip in'
+    case 'hip-in-R':
+      return 'right hip in'
+    case 'drop-knee-L':
+      return 'left drop knee'
+    case 'drop-knee-R':
+      return 'right drop knee'
+    case 'flag-outside-L':
+      return 'left outside flag'
+    case 'flag-outside-R':
+      return 'right outside flag'
+    default:
+      return 'hips square'
+  }
+}
+
+function stanceSentence(pose: Pose | undefined, contacts: Contacts, ctx: PlannerContext): string | null {
+  if (!pose || !pose.stance || pose.stance === 'square') return null
+  const footName = (f: FootContact) => (f?.kind === 'hold' ? holdName(ctx.byId.get(f.id)) : null)
+  switch (pose.stance) {
+    case 'hip-in-L':
+      return `Left hip in${footName(contacts.LF) ? `, outside edge on ${footName(contacts.LF)}` : ''}.`
+    case 'hip-in-R':
+      return `Right hip in${footName(contacts.RF) ? `, outside edge on ${footName(contacts.RF)}` : ''}.`
+    case 'drop-knee-L':
+      return `Drop the left knee${footName(contacts.LF) ? ` on ${footName(contacts.LF)}` : ''} and let the right shoulder reach.`
+    case 'drop-knee-R':
+      return `Drop the right knee${footName(contacts.RF) ? ` on ${footName(contacts.RF)}` : ''} and let the left shoulder reach.`
+    case 'flag-outside-L':
+      return 'Flag the left leg out to the left so the hips stay over the holds.'
+    case 'flag-outside-R':
+      return 'Flag the right leg out to the right so the hips stay over the holds.'
+    default:
+      return null
+  }
+}
+
 export interface MoveDescriptionInput {
   kind: MoveKind
   limb: Limb | null
@@ -63,6 +103,7 @@ export interface MoveDescriptionInput {
   stretch: Partial<Record<Limb, number>>
   dynamic: boolean
   ctx: PlannerContext
+  pose?: Pose
 }
 
 export function describeMove(m: MoveDescriptionInput): { title: string; detail: string[]; caveats: string[] } {
@@ -97,8 +138,12 @@ export function describeMove(m: MoveDescriptionInput): { title: string; detail: 
       break
     case 'dyno':
       title = `Deadpoint ${LIMB_NAMES[limb]} to ${holdName(hold)}`
-      detail.push('Sink low, drive with the legs and pull through; catch the hold at the top of the motion (deadpoint).')
-      caveats.push('Dynamic move: a static lock-off here would exceed your estimated strength.')
+      detail.push('Sink and turn the hip in, drive with the legs, and catch the hold as the body slows.')
+      caveats.push('Dynamic move: no static stance could let go and still catch this hold.')
+      break
+    case 'mantle':
+      title = `Mantle onto ${holdName(hold)}`
+      detail.push('Press down on the hold, walk the feet up, and rock the hips over it.')
       break
     case 'reach':
       title = `${name} → ${holdName(hold)}`
@@ -123,6 +168,9 @@ export function describeMove(m: MoveDescriptionInput): { title: string; detail: 
     default:
       title = `${name} → ${holdName(footHold)}`
   }
+
+  const stanceLine = stanceSentence(m.pose, contacts, ctx)
+  if (stanceLine) detail.push(stanceLine)
 
   if (hold) {
     const hint = directionHint(hold, limb)

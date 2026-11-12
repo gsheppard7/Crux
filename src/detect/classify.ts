@@ -137,6 +137,7 @@ export function classifyComponent(comp: SegmentComponent, opts: ClassifyOptions)
     source: 'model',
     color: comp.meanColorHex.toLowerCase(),
     note: '',
+    patches: null,
   }
 }
 

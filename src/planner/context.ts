@@ -1,10 +1,12 @@
 import type { Hold, Route } from '../model/schema'
 import { wallFrame } from '../model/coords'
 import { bodyDims, type ClimberProfile } from '../climber/profile'
+import { shoulderGap, hipGap } from './body'
 import { DEFAULT_DEPTH_CM } from './grip'
+import { derivePatches } from './patches'
 import type { PlannerContext, PlannerHold } from './types'
 
-/** Body offsets from the wall plane when reaching (chest in) and standing (hips). */
+/** Body offsets from the wall plane when reaching square (chest in) and standing (hips). */
 export const SHOULDER_WALL_OFFSET = 0.15
 export const HIP_WALL_OFFSET = 0.18
 
@@ -14,7 +16,7 @@ export function toPlannerHold(h: Hold, route: Route): PlannerHold {
   const frame = wallFrame(route.image, route.wall)
   const p = frame.toWall(h)
   const r = h.radius * route.image.width * route.wall.metersPerPixel
-  return {
+  const base: PlannerHold = {
     id: h.id,
     label: h.label,
     x: p.x,
@@ -30,7 +32,9 @@ export function toPlannerHold(h: Hold, route: Route): PlannerHold {
     matchable: h.type !== 'foot-chip' && (MATCHABLE_TYPES.has(h.type) || 2 * r >= 0.09),
     confidence: h.confidence,
     source: h.source,
+    patches: [],
   }
+  return { ...base, patches: h.patches?.length ? h.patches : derivePatches(base) }
 }
 
 /**
@@ -69,8 +73,9 @@ export function buildContext(route: Route, profile: ClimberProfile): PlannerCont
     frame,
     profile,
     dims,
-    handReach: Math.sqrt(dims.arm ** 2 - SHOULDER_WALL_OFFSET ** 2),
-    footReach: Math.sqrt(dims.leg ** 2 - HIP_WALL_OFFSET ** 2),
+    // Longest stance (drop knee) so the geometric filter does not drop a move a hip twist could make.
+    handReach: Math.sqrt(Math.max(0.04, dims.arm ** 2 - shoulderGap('drop-knee-L') ** 2)),
+    footReach: Math.sqrt(Math.max(0.04, dims.leg ** 2 - hipGap('drop-knee-L') ** 2)),
     scaleCalibrated: route.wall.scaleSource !== 'default',
   }
 }
